@@ -1,3 +1,8 @@
-fastapi
-uvicorn
-pydantic
+fastapi[all]
+uvicorn[standard]
+pydantic-settings
+pyjwt[crypto]
+sqlalchemy
+psycopg[binary]
+alembic
+pydantic[email]
