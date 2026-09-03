@@ -1,6 +1,7 @@
 import logging
 from datetime import date
 from uuid import UUID
+from datetime import datetime, timezone
 
 from src.integrations.supabase_client import get_supabase
 from src.models.memoir_models import (
@@ -15,9 +16,6 @@ logger = logging.getLogger(__name__)
 def create_memoir(user_id: UUID, request: MemoirCreateRequest) -> MemoirOut:
     client = get_supabase()
 
-    # The account is synchronized by the authentication flow before this
-    # endpoint is called. Do not create placeholder accounts because email is
-    # unique in user_account and placeholder identities break multi-user use.
     user_acct = (
         client.table("user_account")
         .select("full_name, email")
@@ -79,6 +77,51 @@ def create_memoir(user_id: UUID, request: MemoirCreateRequest) -> MemoirOut:
     return MemoirOut(**memoir)
 
 
+def list_memoirs(user_id: UUID | str) -> list[MemoirOut]:
+    client = get_supabase()
+
+    # 1. Fetch participant rows
+    participants = (
+        client.table("memoir_participant")
+        .select("memoir_id")
+        .eq("user_id", str(user_id))
+        .is_("removed_at", "null")
+        .execute()
+    )
+
+    memoir_ids = {
+        row["memoir_id"]
+        for row in (participants.data or [])
+        if row.get("memoir_id")
+    }
+
+    # 2. Also fetch memoirs directly created by this user
+    created_memoirs = (
+        client.table("memoir")
+        .select("id")
+        .eq("created_by_user_id", str(user_id))
+        .execute()
+    )
+
+    for row in (created_memoirs.data or []):
+        if row.get("id"):
+            memoir_ids.add(row["id"])
+
+    if not memoir_ids:
+        return []
+
+    # 3. Fetch full memoir details
+    memoir_res = (
+        client.table("memoir")
+        .select("*")
+        .in_("id", list(memoir_ids))
+        .order("created_at", desc=True)
+        .execute()
+    )
+
+    return [MemoirOut(**row) for row in (memoir_res.data or [])]
+
+
 def get_memoir(memoir_id: UUID, user_id: UUID) -> MemoirOut:
     client = get_supabase()
 
@@ -110,7 +153,6 @@ def list_contributors(
     memoir_id: UUID,
     user_id: UUID,
 ) -> list[ContributorOut]:
-    # Ensures the caller is an active participant before exposing the list.
     get_memoir(memoir_id, user_id)
 
     client = get_supabase()
@@ -131,9 +173,6 @@ def list_contributors(
         role = row["role"]
         is_admin = role in {"owner", "co_owner"}
 
-        # Owners and co-owners are already accepted. An invited contributor is
-        # pending until they open the link; a self-arriving participant is
-        # treated as accepted because no invitation is waiting on them.
         accepted = (
             is_admin
             or row.get("first_opened_at") is not None
@@ -151,3 +190,37 @@ def list_contributors(
         )
 
     return contributors
+
+def publish_memoir(memoir_id: UUID, user_id: UUID) -> MemoirOut:
+    client = get_supabase()
+
+    # Verify that the user has admin/owner rights to this memoir
+    participant = (
+        client.table("memoir_participant")
+        .select("role")
+        .eq("memoir_id", str(memoir_id))
+        .eq("user_id", str(user_id))
+        .is_("removed_at", "null")
+        .maybe_single()
+        .execute()
+    )
+
+    if not participant.data or participant.data["role"] not in ["owner", "co_owner"]:
+        raise PermissionError("Only an owner can publish the memoir.")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    
+    update_res = (
+        client.table("memoir")
+        .update({
+            "status": "published",
+            "published_at": now_iso
+        })
+        .eq("id", str(memoir_id))
+        .execute()
+    )
+
+    if not update_res.data:
+        raise LookupError("Memoir not found.")
+
+    return MemoirOut(**update_res.data[0])

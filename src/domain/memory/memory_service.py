@@ -2,6 +2,8 @@ import logging
 from typing import Optional, List
 from uuid import UUID
 from datetime import datetime, timezone
+from fastapi import BackgroundTasks
+from src.domain.memory.transcription_service import process_audio_transcription
 
 from src.integrations.supabase_client import (
     get_supabase, build_storage_key, create_upload_url,
@@ -172,16 +174,51 @@ def patch_memory(memory_id: UUID, memoir_id: UUID, user_id: UUID, patch: MemoryP
     return _hydrate_memory(result.data[0])
 
 
-def submit_memory(memory_id: UUID, memoir_id: UUID, user_id: UUID) -> MemoryOut:
+def submit_memory(
+    memory_id: UUID,
+    memoir_id: UUID,
+    user_id: UUID,
+    background_tasks: Optional[BackgroundTasks] = None,
+) -> MemoryOut:
     _get_owner_participant(memoir_id, user_id)
     _load_editable_memory(memory_id, memoir_id)
-    client = get_supabase()
-    result = client.table("memory").update({
-        "status": MemoryStatus.submitted.value,
-        "submitted_at": datetime.now(timezone.utc).isoformat(),
-    }).eq("id", str(memory_id)).eq("memoir_id", str(memoir_id)).execute()
-    return _hydrate_memory(result.data[0])
 
+    client = get_supabase()
+    result = (
+        client.table("memory")
+        .update(
+            {
+                "status": MemoryStatus.submitted.value,
+                "submitted_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        .eq("id", str(memory_id))
+        .eq("memoir_id", str(memoir_id))
+        .execute()
+    )
+
+    # Trigger background transcription for audio assets linked to this memory
+    if background_tasks is not None:
+        media_links = (
+            client.table("memory_media")
+            .select("media_asset(id, storage_key, transcription_status, kind)")
+            .eq("memory_id", str(memory_id))
+            .execute()
+        )
+
+        for link in media_links.data or []:
+            asset = link.get("media_asset")
+            if asset and asset.get("kind") == "audio":
+                status = asset.get("transcription_status")
+                if status in ("pending", "skipped", "processing"):
+                    background_tasks.add_task(
+                        process_audio_transcription,
+                        memoir_id,
+                        UUID(asset["id"]),
+                        asset["storage_key"],
+                    )
+
+    return _hydrate_memory(result.data[0])
 
 def delete_memory(memory_id: UUID, memoir_id: UUID, user_id: UUID) -> None:
     participant = _get_owner_participant(memoir_id, user_id)
@@ -343,3 +380,4 @@ def _hydrate_memory(row: dict) -> MemoryOut:
         updated_at=row["updated_at"],
         submitted_at=row.get("submitted_at"),
     )
+

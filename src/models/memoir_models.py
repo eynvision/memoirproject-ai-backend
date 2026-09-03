@@ -36,6 +36,7 @@ class MemoirOut(BaseModel):
     subject_born_on: Optional[date] = None
     subject_died_on: Optional[date] = None
     subject_is_living: bool
+    description: Optional[str] = None   # NEW
     status: str
     created_at: datetime
 
