@@ -1,0 +1,1663 @@
+This file is a merged representation of a subset of the codebase, containing specifically included files, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of a subset of the repository's contents that is considered the most important context.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Only files matching these patterns are included: src/**
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+src/
+  api/
+    example.py
+    memoir.py
+    memory.py
+    user.py
+  core/
+    app_lifespan.py
+    auth.py
+    logging_config.py
+  domain/
+    example_feature/
+      constants.py
+      example_service.py
+      utils.py
+    memoir/
+      memoir_service.py
+    memory/
+      constants.py
+      memory_service.py
+      transcription_service.py
+  integrations/
+    assemblyai_client.py
+    llm_client.py
+    supabase_client.py
+  models/
+    example_models.py
+    memoir_models.py
+    memory_models.py
+  utils/
+    string_helpers.py
+  main.py
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="src/domain/memory/transcription_service.py">
+import asyncio
+import logging
+from uuid import UUID
+
+from src.integrations.assemblyai_client import transcribe_audio_url
+from src.integrations.llm_client import correct_transcript
+from src.integrations.supabase_client import create_read_url, get_supabase
+
+logger = logging.getLogger(__name__)
+
+
+async def process_audio_transcription(
+    memoir_id: UUID, media_asset_id: UUID, storage_key: str
+):
+    """
+    Background pipeline:
+    1. Mark media_asset status as processing.
+    2. Get signed URL for audio file.
+    3. AssemblyAI transcribes (offloaded to thread).
+    4. LLM Agent corrects misspellings.
+    5. Stores final corrected text in transcript table.
+    6. Updates media_asset status to ready.
+    """
+    client = get_supabase()
+
+    try:
+        # Step 1: Mark processing
+        client.table("media_asset").update(
+            {"transcription_status": "processing"}
+        ).eq("id", str(media_asset_id)).execute()
+
+        # Step 2: Get signed URL for AssemblyAI
+        audio_url = create_read_url(storage_key)
+        logger.info("Generated audio URL for AssemblyAI: %s", audio_url)
+
+        # Step 3: Transcribe (Offload synchronous AssemblyAI call to thread pool)
+        raw_text = await asyncio.to_thread(transcribe_audio_url, audio_url)
+        logger.info("Transcription complete for media asset %s", media_asset_id)
+
+        # Step 4: Agent corrects
+        corrected_text = await correct_transcript(raw_text)
+        logger.info("Agent correction complete for media asset %s", media_asset_id)
+
+        # Step 5: Store in transcript table
+        client.table("transcript").insert(
+            {
+                "media_asset_id": str(media_asset_id),
+                "memoir_id": str(memoir_id),
+                "raw_text": corrected_text or raw_text or "No speech detected.",
+                "language": "en",
+                "engine": "assemblyai+agent-corrected",
+                "confidence": None,
+            }
+        ).execute()
+
+        # Step 6: Mark ready
+        client.table("media_asset").update(
+            {"transcription_status": "ready"}
+        ).eq("id", str(media_asset_id)).execute()
+
+        logger.info(
+            "Transcription pipeline finished successfully for media asset %s",
+            media_asset_id,
+        )
+
+    except Exception as error:
+        logger.error(
+            "Transcription pipeline failed for media asset %s: %s",
+            media_asset_id,
+            error,
+            exc_info=True,
+        )
+        client.table("media_asset").update({"transcription_status": "failed"}).eq(
+            "id", str(media_asset_id)
+        ).execute()
+</file>
+
+<file path="src/integrations/assemblyai_client.py">
+import os
+import logging
+import assemblyai as aai
+
+logger = logging.getLogger(__name__)
+
+
+def transcribe_audio_url(audio_url: str) -> str:
+    """
+    Send a Supabase signed audio URL to AssemblyAI (batch/file mode).
+    Returns the raw transcript text.
+    """
+    api_key = os.environ.get("ASSEMBLYAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("ASSEMBLYAI_API_KEY is not configured.")
+
+    aai.settings.api_key = api_key
+    transcriber = aai.Transcriber()
+
+    # Use the new speech_models parameter (plural list) instead of the deprecated speech_model
+    config = aai.TranscriptionConfig(
+        speech_models=["universal-2"]  # or ["universal-3-5-pro"] for best accuracy
+    )
+
+    transcript = transcriber.transcribe(audio_url, config=config)
+
+    if transcript.status == aai.TranscriptStatus.error:
+        logger.error("AssemblyAI error: %s", transcript.error)
+        raise RuntimeError(f"Transcription failed: {transcript.error}")
+
+    return transcript.text or ""
+</file>
+
+<file path="src/api/example.py">
+# API layer = FastAPI routes. Keep this thin: validate request, call domain/, return response.
+
+import logging
+from fastapi import APIRouter, HTTPException
+from src.models.example_models import GreetingRequest, GreetingResponse
+from src.domain.example_feature.example_service import create_greeting
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/example", tags=["example"])
+
+
+@router.post("/greet", response_model=GreetingResponse)
+async def greet(request: GreetingRequest):
+    try:
+        message = create_greeting(request.name, request.excited)
+        return GreetingResponse(message=message, success=True)
+    except Exception as e:
+        logger.error(f"Error creating greeting: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+</file>
+
+<file path="src/api/memoir.py">
+import logging
+from typing import List
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, status
+
+from src.core.auth import get_current_user_id
+from src.domain.memoir import memoir_service
+from src.models.memoir_models import (
+    ContributorOut,
+    MemoirCreateRequest,
+    MemoirOut,
+)
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/memoirs", tags=["memoirs"])
+
+
+@router.post("", response_model=MemoirOut, status_code=status.HTTP_201_CREATED)
+async def create_memoir(
+    request: MemoirCreateRequest,
+    user_id: UUID = Depends(get_current_user_id),
+):
+    try:
+        return memoir_service.create_memoir(user_id, request)
+    except PermissionError as error:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(error))
+    except Exception as error:
+        logger.error("Failed to create memoir: %s", error)
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Could not create memoir.",
+        )
+
+
+@router.get("", response_model=List[MemoirOut])
+async def list_memoirs(
+    user_id: UUID = Depends(get_current_user_id),
+):
+    try:
+        return memoir_service.list_memoirs(user_id=user_id)
+    except Exception as e:
+        logger.error(f"Failed to list memoirs: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to list memoirs",
+        )
+
+
+@router.get("/{memoir_id}", response_model=MemoirOut)
+async def get_memoir(
+    memoir_id: UUID,
+    user_id: UUID = Depends(get_current_user_id),
+):
+    try:
+        return memoir_service.get_memoir(memoir_id, user_id)
+    except PermissionError as error:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(error))
+    except Exception as error:
+        logger.error("Failed to get memoir: %s", error)
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Could not load memoir.",
+        )
+
+
+@router.get("/{memoir_id}/contributors", response_model=List[ContributorOut])
+async def list_contributors(
+    memoir_id: UUID,
+    user_id: UUID = Depends(get_current_user_id),
+):
+    try:
+        return memoir_service.list_contributors(memoir_id, user_id)
+    except PermissionError as error:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(error))
+    except Exception as error:
+        logger.error("Failed to list contributors: %s", error)
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Could not load contributors.",
+        )
+</file>
+
+<file path="src/api/memory.py">
+import logging
+from uuid import UUID
+from typing import List, Optional
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+
+from src.core.auth import get_current_user_id
+from src.domain.memory import memory_service
+from src.models.memory_models import (
+    MediaAssetOut,
+    MediaConfirmRequest,
+    MemoryCreateRequest,
+    MemoryListResponse,
+    MemoryOut,
+    MemoryPatchRequest,
+    PresignRequest,
+    PresignResponse,
+)
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/memoirs/{memoir_id}/memories", tags=["memories"])
+
+
+@router.get("", response_model=MemoryListResponse)
+async def list_memories(
+    memoir_id: UUID,
+    include_drafts: bool = True,
+    user_id: UUID = Depends(get_current_user_id),
+):
+    try:
+        memories, total = memory_service.list_memories(
+            memoir_id, user_id, include_drafts=include_drafts
+        )
+        return MemoryListResponse(memories=memories, total=total)
+    except PermissionError as e:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(e))
+
+
+@router.post("", response_model=MemoryOut, status_code=status.HTTP_201_CREATED)
+async def create_memory(
+    memoir_id: UUID,
+    request: MemoryCreateRequest,
+    user_id: UUID = Depends(get_current_user_id),
+):
+    try:
+        return memory_service.create_draft(memoir_id, user_id, request)
+    except PermissionError as e:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(e))
+
+
+@router.get("/{memory_id}", response_model=MemoryOut)
+async def get_memory(
+    memoir_id: UUID, memory_id: UUID, user_id: UUID = Depends(get_current_user_id)
+):
+    try:
+        return memory_service.get_memory(memory_id, memoir_id, user_id)
+    except LookupError as e:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(e))
+    except PermissionError as e:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(e))
+
+
+@router.patch("/{memory_id}", response_model=MemoryOut)
+async def patch_memory(
+    memoir_id: UUID,
+    memory_id: UUID,
+    patch: MemoryPatchRequest,
+    user_id: UUID = Depends(get_current_user_id),
+):
+    try:
+        return memory_service.patch_memory(memory_id, memoir_id, user_id, patch)
+    except LookupError as e:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(e))
+    except PermissionError as e:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(e))
+
+
+@router.post("/{memory_id}/submit", response_model=MemoryOut)
+async def submit_memory(
+    memoir_id: UUID,
+    memory_id: UUID,
+    background_tasks: BackgroundTasks,
+    user_id: UUID = Depends(get_current_user_id),
+):
+    try:
+        return memory_service.submit_memory(
+            memory_id, memoir_id, user_id, background_tasks
+        )
+    except LookupError as e:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(e))
+    except PermissionError as e:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(e))
+
+
+@router.delete("/{memory_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_memory(
+    memoir_id: UUID, memory_id: UUID, user_id: UUID = Depends(get_current_user_id)
+):
+    try:
+        memory_service.delete_memory(memory_id, memoir_id, user_id)
+    except LookupError as e:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(e))
+    except PermissionError as e:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(e))
+
+
+@router.post("/{memory_id}/media/presign", response_model=PresignResponse)
+async def presign_media_upload(
+    memoir_id: UUID,
+    memory_id: UUID,
+    request: PresignRequest,
+    user_id: UUID = Depends(get_current_user_id),
+):
+    try:
+        return memory_service.presign_upload(memoir_id, memory_id, user_id, request)
+    except ValueError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
+    except PermissionError as e:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(e))
+
+
+@router.post(
+    "/{memory_id}/media/confirm",
+    response_model=MediaAssetOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def confirm_media_upload(
+    memoir_id: UUID,
+    memory_id: UUID,
+    request: MediaConfirmRequest,
+    user_id: UUID = Depends(get_current_user_id),
+):
+    try:
+        return memory_service.confirm_media(memoir_id, memory_id, user_id, request)
+    except PermissionError as e:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(e))
+
+
+@router.delete(
+    "/{memory_id}/media/{media_asset_id}", status_code=status.HTTP_204_NO_CONTENT
+)
+async def remove_media(
+    memoir_id: UUID,
+    memory_id: UUID,
+    media_asset_id: UUID,
+    user_id: UUID = Depends(get_current_user_id),
+):
+    try:
+        memory_service.remove_media(memoir_id, memory_id, media_asset_id, user_id)
+    except LookupError as e:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(e))
+    except PermissionError as e:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(e))
+</file>
+
+<file path="src/api/user.py">
+import logging
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field
+
+from src.core.auth import get_current_user_id
+from src.integrations.supabase_client import get_supabase
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/users", tags=["users"])
+
+
+class UserCreateRequest(BaseModel):
+    id: UUID
+    email: str
+    full_name: str = Field(..., min_length=1, max_length=200)
+
+
+@router.post("", status_code=status.HTTP_201_CREATED)
+async def create_user(
+    request: UserCreateRequest,
+    current_user_id: UUID = Depends(get_current_user_id),
+):
+    """Create or update the backend account for the authenticated user."""
+    if request.id != current_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User identity does not match the access token.",
+        )
+
+    full_name = request.full_name.strip()
+    if not full_name:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Full name cannot be blank.",
+        )
+
+    try:
+        client = get_supabase()
+        client.table("user_account").upsert(
+            {
+                "id": str(current_user_id),
+                "email": request.email.strip(),
+                "full_name": full_name,
+                "auth_provider_uid": str(current_user_id),
+            },
+            on_conflict="id",
+        ).execute()
+
+        return {"success": True}
+    except Exception as error:
+        logger.error("Failed to synchronize user account: %s", error)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not create user account.",
+        )
+</file>
+
+<file path="src/core/app_lifespan.py">
+# App-wide startup/shutdown hooks (e.g. warming up connections, background tasks).
+
+import logging
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("App starting up...")
+    yield
+    logger.info("App shutting down...")
+</file>
+
+<file path="src/core/auth.py">
+# File: backend/src/core/auth.py
+
+import os
+import logging
+from typing import Optional
+from uuid import UUID
+from fastapi import Header, HTTPException, status
+from jose import jwt, JWTError
+
+logger = logging.getLogger(__name__)
+
+# Development fallback - only used when no auth is present
+DEV_USER_ID = UUID("00000000-0000-0000-0000-000000000001")
+
+
+def get_current_user_id(authorization: Optional[str] = Header(None)) -> UUID:
+    """
+    Extract user ID from Supabase JWT token.
+    Falls back to DEV_USER_ID only in local development without auth.
+    """
+    if not authorization:
+        # In production this should raise 401, but for local dev we allow fallback
+        if os.getenv("ENVIRONMENT", "development") == "development":
+            logger.info("No Authorization header. Using DEV_USER_ID for local development.")
+            return DEV_USER_ID
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing authorization header.",
+        )
+
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authorization header format. Expected 'Bearer <token>'.",
+        )
+
+    token = authorization.removeprefix("Bearer ").strip()
+    
+    try:
+        jwt_secret = os.getenv("SUPABASE_JWT_SECRET")
+        
+        # In development without JWT secret, just decode without verification
+        if not jwt_secret or os.getenv("ENVIRONMENT", "development") == "development":
+            logger.debug("Development mode: Decoding token without verification")
+            payload = jwt.get_unverified_claims(token)
+        else:
+            # Production: verify with RS256 (Supabase uses asymmetric keys)
+            # For RS256, SUPABASE_JWT_SECRET should be the public key
+            payload = jwt.decode(
+                token,
+                jwt_secret,
+                algorithms=["RS256", "HS256"],  # Support both for flexibility
+                audience="authenticated",
+                options={"verify_aud": False}  # Supabase tokens may not have 'aud'
+            )
+        
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token missing 'sub' claim.",
+            )
+        
+        return UUID(user_id)
+        
+    except JWTError as e:
+        # In development, fall back to unverified decode
+        if os.getenv("ENVIRONMENT", "development") == "development":
+            logger.warning(f"JWT verification failed in dev mode: {e}. Using unverified decode.")
+            try:
+                payload = jwt.get_unverified_claims(token)
+                user_id = payload.get("sub")
+                if user_id:
+                    logger.info(f"Using unverified user ID: {user_id}")
+                    return UUID(user_id)
+            except Exception as fallback_error:
+                logger.error(f"Even unverified decode failed: {fallback_error}")
+        
+        logger.error(f"JWT decode error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication token.",
+        )
+    except ValueError as e:
+        logger.error(f"Invalid UUID in token: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid user ID format in token.",
+        )
+</file>
+
+<file path="src/core/logging_config.py">
+# App-wide logging setup. Called once from main.py on startup.
+
+import logging
+
+
+def setup_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+</file>
+
+<file path="src/domain/example_feature/constants.py">
+# Constants specific to this feature only. Shared/global constants would live in src/utils instead.
+
+DEFAULT_GREETING = "Hello"
+EXCITED_SUFFIX = "!"
+NORMAL_SUFFIX = "."
+</file>
+
+<file path="src/domain/example_feature/example_service.py">
+# Domain layer = the actual business logic for a feature.
+# The API layer calls into functions here; this layer can call integrations/ for external services.
+
+import logging
+from src.domain.example_feature.utils import format_greeting
+from src.domain.example_feature.constants import DEFAULT_GREETING
+
+logger = logging.getLogger(__name__)
+
+
+def create_greeting(name: str, excited: bool = False) -> str:
+    """Example business logic: build a greeting string for a given name."""
+    logger.info(f"Creating greeting for name={name}")
+    if not name:
+        name = DEFAULT_GREETING
+    return format_greeting(name, excited)
+</file>
+
+<file path="src/domain/example_feature/utils.py">
+# Feature-specific helper functions used only by this feature's service logic.
+
+from src.domain.example_feature.constants import EXCITED_SUFFIX, NORMAL_SUFFIX
+
+
+def format_greeting(name: str, excited: bool) -> str:
+    suffix = EXCITED_SUFFIX if excited else NORMAL_SUFFIX
+    return f"Hello, {name}{suffix}"
+</file>
+
+<file path="src/domain/memoir/memoir_service.py">
+import logging
+from datetime import date
+from uuid import UUID
+
+from src.integrations.supabase_client import get_supabase
+from src.models.memoir_models import (
+    ContributorOut,
+    MemoirCreateRequest,
+    MemoirOut,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def create_memoir(user_id: UUID, request: MemoirCreateRequest) -> MemoirOut:
+    client = get_supabase()
+
+    user_acct = (
+        client.table("user_account")
+        .select("full_name, email")
+        .eq("id", str(user_id))
+        .maybe_single()
+        .execute()
+    )
+
+    if not user_acct.data:
+        raise PermissionError(
+            "User account is not initialized. Please sign in again."
+        )
+
+    display_name = str(user_acct.data["full_name"]).strip()
+    email = str(user_acct.data["email"]).strip()
+
+    born_on = (
+        date(request.birth_year, 1, 1).isoformat()
+        if request.birth_year
+        else None
+    )
+    died_on = (
+        date(request.end_year, 1, 1).isoformat()
+        if request.end_year and not request.is_living
+        else None
+    )
+
+    memoir_res = (
+        client.table("memoir")
+        .insert(
+            {
+                "subject_name": request.subject_name.strip(),
+                "subject_born_on": born_on,
+                "subject_died_on": died_on,
+                "subject_is_living": request.is_living,
+                "created_by_user_id": str(user_id),
+                "status": "draft",
+            }
+        )
+        .execute()
+    )
+
+    if not memoir_res.data:
+        raise RuntimeError("Memoir was not created.")
+
+    memoir = memoir_res.data[0]
+
+    client.table("memoir_participant").insert(
+        {
+            "memoir_id": memoir["id"],
+            "user_id": str(user_id),
+            "role": "owner",
+            "display_name": display_name,
+            "email": email,
+            "relationship": request.relationship.value,
+        }
+    ).execute()
+
+    return MemoirOut(**memoir)
+
+
+def list_memoirs(user_id: UUID | str) -> list[MemoirOut]:
+    client = get_supabase()
+
+    # 1. Fetch participant rows
+    participants = (
+        client.table("memoir_participant")
+        .select("memoir_id")
+        .eq("user_id", str(user_id))
+        .is_("removed_at", "null")
+        .execute()
+    )
+
+    memoir_ids = {
+        row["memoir_id"]
+        for row in (participants.data or [])
+        if row.get("memoir_id")
+    }
+
+    # 2. Also fetch memoirs directly created by this user
+    created_memoirs = (
+        client.table("memoir")
+        .select("id")
+        .eq("created_by_user_id", str(user_id))
+        .execute()
+    )
+
+    for row in (created_memoirs.data or []):
+        if row.get("id"):
+            memoir_ids.add(row["id"])
+
+    if not memoir_ids:
+        return []
+
+    # 3. Fetch full memoir details
+    memoir_res = (
+        client.table("memoir")
+        .select("*")
+        .in_("id", list(memoir_ids))
+        .order("created_at", desc=True)
+        .execute()
+    )
+
+    return [MemoirOut(**row) for row in (memoir_res.data or [])]
+
+
+def get_memoir(memoir_id: UUID, user_id: UUID) -> MemoirOut:
+    client = get_supabase()
+
+    participant = (
+        client.table("memoir_participant")
+        .select("id")
+        .eq("memoir_id", str(memoir_id))
+        .eq("user_id", str(user_id))
+        .is_("removed_at", "null")
+        .maybe_single()
+        .execute()
+    )
+
+    if not participant or not participant.data:
+        raise PermissionError("Not authorized to view this memoir.")
+
+    result = (
+        client.table("memoir")
+        .select("*")
+        .eq("id", str(memoir_id))
+        .single()
+        .execute()
+    )
+
+    return MemoirOut(**result.data)
+
+
+def list_contributors(
+    memoir_id: UUID,
+    user_id: UUID,
+) -> list[ContributorOut]:
+    get_memoir(memoir_id, user_id)
+
+    client = get_supabase()
+    result = (
+        client.table("memoir_participant")
+        .select(
+            "id, email, display_name, role, invited_at, first_opened_at"
+        )
+        .eq("memoir_id", str(memoir_id))
+        .is_("removed_at", "null")
+        .order("created_at")
+        .execute()
+    )
+
+    contributors: list[ContributorOut] = []
+
+    for row in result.data or []:
+        role = row["role"]
+        is_admin = role in {"owner", "co_owner"}
+
+        accepted = (
+            is_admin
+            or row.get("first_opened_at") is not None
+            or row.get("invited_at") is None
+        )
+
+        contributors.append(
+            ContributorOut(
+                id=row["id"],
+                email=row.get("email"),
+                display_name=row["display_name"],
+                role="Admin" if is_admin else "Contributor",
+                status="Accepted" if accepted else "Pending",
+            )
+        )
+
+    return contributors
+</file>
+
+<file path="src/domain/memory/constants.py">
+ALLOWED_AUDIO_MIME = {
+    "audio/webm",
+    "audio/mpeg",
+    "audio/mp4",
+    "audio/wav",
+    "audio/ogg",
+    "audio/aac",
+    "audio/x-m4a",
+}
+ALLOWED_PHOTO_MIME = {
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+    "image/webp",
+}
+MAX_AUDIO_SIZE_BYTES = 50 * 1024 * 1024
+MAX_PHOTO_SIZE_BYTES = 10 * 1024 * 1024
+MAX_PHOTOS_PER_MEMORY = 5
+</file>
+
+<file path="src/domain/memory/memory_service.py">
+import logging
+from typing import Optional, List
+from uuid import UUID
+from datetime import datetime, timezone
+from fastapi import BackgroundTasks
+from src.domain.memory.transcription_service import process_audio_transcription
+
+from src.integrations.supabase_client import (
+    get_supabase, build_storage_key, create_upload_url,
+    create_read_url, delete_object,
+)
+from src.models.memory_models import (
+    MemoryOut, MemoryCreateRequest, MemoryPatchRequest,
+    PresignRequest, PresignResponse, MediaConfirmRequest,
+    MediaAssetOut, MemoryStatus, MediaKind, MediaLinkType, TranscodeStatus
+)
+from src.domain.memory.constants import (
+    ALLOWED_AUDIO_MIME, ALLOWED_PHOTO_MIME,
+    MAX_AUDIO_SIZE_BYTES, MAX_PHOTO_SIZE_BYTES,
+    MAX_PHOTOS_PER_MEMORY,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _get_owner_participant(memoir_id: UUID, user_id: UUID) -> dict:
+    client = get_supabase()
+    result = (
+        client.table("memoir_participant")
+        .select("id, memoir_id, role, user_id")
+        .eq("memoir_id", str(memoir_id))
+        .eq("user_id", str(user_id))
+        .eq("role", "owner")
+        .is_("removed_at", "null")
+        .maybe_single()
+        .execute()
+    )
+    if not result.data:
+        raise PermissionError("User is not an active owner of this memoir.")
+    return result.data
+
+
+def _load_editable_memory(memory_id: UUID, memoir_id: UUID) -> dict:
+    client = get_supabase()
+    memoir = (
+        client.table("memoir")
+        .select("status")
+        .eq("id", str(memoir_id))
+        .single()
+        .execute()
+    )
+    if memoir.data and memoir.data.get("status") == "published":
+        raise PermissionError("Published memoirs and their memories are immutable.")
+
+    result = (
+        client.table("memory")
+        .select("*")
+        .eq("id", str(memory_id))
+        .eq("memoir_id", str(memoir_id))
+        .is_("deleted_at", "null")
+        .maybe_single()
+        .execute()
+    )
+    if not result.data:
+        raise LookupError("Memory not found or has been removed.")
+    return result.data
+
+
+def list_memories(memoir_id: UUID, user_id: UUID, include_drafts: bool = True) -> tuple[List[MemoryOut], int]:
+    _get_owner_participant(memoir_id, user_id)
+    client = get_supabase()
+    
+    statuses = ["submitted", "draft"] if include_drafts else ["submitted"]
+    
+    result = (
+        client.table("memory")
+        .select("*")
+        .eq("memoir_id", str(memoir_id))
+        .in_("status", statuses)
+        .is_("deleted_at", "null")
+        .order("updated_at", desc=True)
+        .execute()
+    )
+    
+    if not result.data:
+        return [], 0
+    
+    memory_ids = [m["id"] for m in result.data]
+    
+    all_media = (
+        client.table("memory_media")
+        .select("memory_id, position, link_type, media_asset(*)")
+        .in_("memory_id", memory_ids)
+        .is_("media_asset.deleted_at", "null")
+        .order("memory_id, position")
+        .execute()
+    )
+    
+    media_by_memory: dict[str, list] = {}
+    for m in all_media.data:
+        memory_id = m["memory_id"]
+        if memory_id not in media_by_memory:
+            media_by_memory[memory_id] = []
+        
+        asset = m.get("media_asset")
+        if asset:
+            media_by_memory[memory_id].append(MediaAssetOut(
+                id=asset["id"],
+                memoir_id=asset["memoir_id"],
+                kind=asset["kind"],
+                storage_key=asset["storage_key"],
+                mime_type=asset["mime_type"],
+                byte_size=asset["byte_size"],
+                duration_ms=asset.get("duration_ms"),
+                width_px=asset.get("width_px"),
+                height_px=asset.get("height_px"),
+                caption=asset.get("caption"),
+                playback_url=create_read_url(asset["storage_key"]),
+                position=m["position"],
+                link_type=m["link_type"],
+                transcription_status=asset["transcription_status"],
+                created_at=asset["created_at"],
+            ))
+    
+    memories = []
+    for row in result.data:
+        memories.append(MemoryOut(
+            id=row["id"],
+            memoir_id=row["memoir_id"],
+            author_participant_id=row["author_participant_id"],
+            prompt_id=row.get("prompt_id"),
+            title=row.get("title"),
+            body_text=row.get("body_text"),
+            status=row["status"],
+            media=media_by_memory.get(row["id"], []),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            submitted_at=row.get("submitted_at"),
+        ))
+    
+    return memories, len(memories)
+
+
+def get_memory(memory_id: UUID, memoir_id: UUID, user_id: UUID) -> MemoryOut:
+    _get_owner_participant(memoir_id, user_id)
+    row = _load_editable_memory(memory_id, memoir_id)
+    return _hydrate_memory(row)
+
+
+def create_draft(memoir_id: UUID, user_id: UUID, request: MemoryCreateRequest) -> MemoryOut:
+    participant = _get_owner_participant(memoir_id, user_id)
+    client = get_supabase()
+    insert_payload = {
+        "memoir_id": str(memoir_id),
+        "author_participant_id": participant["id"],
+        "title": request.title,
+        "body_text": request.body_text,
+        "prompt_id": str(request.prompt_id) if request.prompt_id else None,
+        "status": MemoryStatus.draft.value,
+    }
+    result = client.table("memory").insert(insert_payload).execute()
+    logger.info("Created draft memory %s", result.data[0]["id"])
+    return _hydrate_memory(result.data[0])
+
+
+def patch_memory(memory_id: UUID, memoir_id: UUID, user_id: UUID, patch: MemoryPatchRequest) -> MemoryOut:
+    _get_owner_participant(memoir_id, user_id)
+    _load_editable_memory(memory_id, memoir_id)
+    updates = {k: v for k, v in patch.model_dump(exclude_unset=True).items()}
+    if not updates:
+        return get_memory(memory_id, memoir_id, user_id)
+    client = get_supabase()
+    result = client.table("memory").update(updates).eq("id", str(memory_id)).eq("memoir_id", str(memoir_id)).execute()
+    return _hydrate_memory(result.data[0])
+
+
+def submit_memory(
+    memory_id: UUID,
+    memoir_id: UUID,
+    user_id: UUID,
+    background_tasks: Optional[BackgroundTasks] = None,
+) -> MemoryOut:
+    _get_owner_participant(memoir_id, user_id)
+    _load_editable_memory(memory_id, memoir_id)
+
+    client = get_supabase()
+    result = (
+        client.table("memory")
+        .update(
+            {
+                "status": MemoryStatus.submitted.value,
+                "submitted_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        .eq("id", str(memory_id))
+        .eq("memoir_id", str(memoir_id))
+        .execute()
+    )
+
+    # Trigger background transcription for audio assets linked to this memory
+    if background_tasks is not None:
+        media_links = (
+            client.table("memory_media")
+            .select("media_asset(id, storage_key, transcription_status, kind)")
+            .eq("memory_id", str(memory_id))
+            .execute()
+        )
+
+        for link in media_links.data or []:
+            asset = link.get("media_asset")
+            if asset and asset.get("kind") == "audio":
+                status = asset.get("transcription_status")
+                if status in ("pending", "skipped", "processing"):
+                    background_tasks.add_task(
+                        process_audio_transcription,
+                        memoir_id,
+                        UUID(asset["id"]),
+                        asset["storage_key"],
+                    )
+
+    return _hydrate_memory(result.data[0])
+
+def delete_memory(memory_id: UUID, memoir_id: UUID, user_id: UUID) -> None:
+    participant = _get_owner_participant(memoir_id, user_id)
+    _load_editable_memory(memory_id, memoir_id)
+    client = get_supabase()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    client.table("memory").update({
+        "deleted_at": now_iso,
+        "deleted_by_participant_id": participant["id"],
+    }).eq("id", str(memory_id)).eq("memoir_id", str(memoir_id)).execute()
+
+
+def presign_upload(memoir_id: UUID, memory_id: UUID, user_id: UUID, request: PresignRequest) -> PresignResponse:
+    _get_owner_participant(memoir_id, user_id)
+    _load_editable_memory(memory_id, memoir_id)
+    _validate_media_request(memoir_id, memory_id, request)
+    storage_key = build_storage_key(str(memoir_id), request.kind.value, request.mime_type)
+    upload_url, expires_at = create_upload_url(storage_key)
+    return PresignResponse(upload_url=upload_url, storage_key=storage_key, expires_at=expires_at)
+
+
+def confirm_media(memoir_id: UUID, memory_id: UUID, user_id: UUID, request: MediaConfirmRequest) -> MediaAssetOut:
+    participant = _get_owner_participant(memoir_id, user_id)
+    _load_editable_memory(memory_id, memoir_id)
+    
+    transcription_status = (
+        TranscodeStatus.skipped.value
+        if request.kind == MediaKind.photo
+        else TranscodeStatus.pending.value
+    )
+    
+    # Strictly enforce DB constraint: (kind = 'photo') = (duration_ms IS NULL)
+    if request.kind == MediaKind.audio:
+        duration_ms = int(request.duration_ms) if request.duration_ms is not None and request.duration_ms > 0 else 1000
+    else:
+        duration_ms = None
+
+    clean_mime = request.mime_type.split(";")[0].strip().lower()
+
+    client = get_supabase()
+    asset_result = client.table("media_asset").insert({
+        "memoir_id": str(memoir_id),
+        "kind": request.kind.value,
+        "storage_key": request.storage_key,
+        "mime_type": clean_mime,
+        "byte_size": request.byte_size,
+        "checksum_sha256": request.checksum_sha256,
+        "original_filename": request.original_filename,
+        "duration_ms": duration_ms,
+        "width_px": request.width_px,
+        "height_px": request.height_px,
+        "caption": request.caption,
+        "transcription_status": transcription_status,
+        "uploaded_by_participant_id": participant["id"],
+    }).execute()
+    asset = asset_result.data[0]
+    
+    position_result = client.table("memory_media").select("position").eq("memory_id", str(memory_id)).order("position", desc=True).limit(1).execute()
+    next_position = (position_result.data[0]["position"] + 1) if position_result.data else 0
+    
+    client.table("memory_media").insert({
+        "memory_id": str(memory_id),
+        "media_asset_id": asset["id"],
+        "memoir_id": str(memoir_id),
+        "link_type": MediaLinkType.primary.value,
+        "position": next_position,
+        "created_by": "contributor",
+    }).execute()
+
+    return MediaAssetOut(
+        id=asset["id"],
+        memoir_id=asset["memoir_id"],
+        kind=asset["kind"],
+        storage_key=asset["storage_key"],
+        mime_type=asset["mime_type"],
+        byte_size=asset["byte_size"],
+        duration_ms=asset.get("duration_ms"),
+        width_px=asset.get("width_px"),
+        height_px=asset.get("height_px"),
+        caption=asset.get("caption"),
+        playback_url=create_read_url(asset["storage_key"]),
+        position=next_position,
+        link_type=MediaLinkType.primary,
+        transcription_status=asset["transcription_status"],
+        created_at=asset["created_at"],
+    )
+
+
+def remove_media(memoir_id: UUID, memory_id: UUID, media_asset_id: UUID, user_id: UUID) -> None:
+    _get_owner_participant(memoir_id, user_id)
+    _load_editable_memory(memory_id, memoir_id)
+    client = get_supabase()
+    client.table("memory_media").delete().eq("memory_id", str(memory_id)).eq("media_asset_id", str(media_asset_id)).execute()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    client.table("media_asset").update({"deleted_at": now_iso}).eq("id", str(media_asset_id)).eq("memoir_id", str(memoir_id)).execute()
+
+
+def _validate_media_request(memoir_id: UUID, memory_id: UUID, request: PresignRequest) -> None:
+    base_mime = request.mime_type.split(";")[0].strip().lower()
+    if request.kind == MediaKind.audio:
+        if base_mime not in ALLOWED_AUDIO_MIME:
+            raise ValueError(f"Unsupported audio type: {request.mime_type}")
+        if request.byte_size > MAX_AUDIO_SIZE_BYTES:
+            raise ValueError("Audio file exceeds 50 MB limit.")
+    elif request.kind == MediaKind.photo:
+        if base_mime not in ALLOWED_PHOTO_MIME:
+            raise ValueError(f"Unsupported photo type: {request.mime_type}")
+        if request.byte_size > MAX_PHOTO_SIZE_BYTES:
+            raise ValueError("Photo file exceeds 10 MB limit.")
+        client = get_supabase()
+        count = client.table("memory_media").select("media_asset!inner(kind)", count="exact").eq("memory_id", str(memory_id)).eq("media_asset.kind", "photo").is_("media_asset.deleted_at", "null").execute()
+        if (count.count or 0) >= MAX_PHOTOS_PER_MEMORY:
+            raise ValueError(f"Maximum {MAX_PHOTOS_PER_MEMORY} photos per memory.")
+
+
+def _hydrate_memory(row: dict) -> MemoryOut:
+    client = get_supabase()
+    media_rows = (
+        client.table("memory_media")
+        .select("position, link_type, media_asset(*)")
+        .eq("memory_id", row["id"])
+        .is_("media_asset.deleted_at", "null")
+        .order("position")
+        .execute()
+    )
+    
+    media = []
+    for m in media_rows.data:
+        asset = m.get("media_asset")
+        if not asset:
+            continue
+        media.append(MediaAssetOut(
+            id=asset["id"],
+            memoir_id=asset["memoir_id"],
+            kind=asset["kind"],
+            storage_key=asset["storage_key"],
+            mime_type=asset["mime_type"],
+            byte_size=asset["byte_size"],
+            duration_ms=asset.get("duration_ms"),
+            width_px=asset.get("width_px"),
+            height_px=asset.get("height_px"),
+            caption=asset.get("caption"),
+            playback_url=create_read_url(asset["storage_key"]),
+            position=m["position"],
+            link_type=m["link_type"],
+            transcription_status=asset["transcription_status"],
+            created_at=asset["created_at"],
+        ))
+    return MemoryOut(
+        id=row["id"],
+        memoir_id=row["memoir_id"],
+        author_participant_id=row["author_participant_id"],
+        prompt_id=row.get("prompt_id"),
+        title=row.get("title"),
+        body_text=row.get("body_text"),
+        status=row["status"],
+        media=media,
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        submitted_at=row.get("submitted_at"),
+    )
+</file>
+
+<file path="src/integrations/llm_client.py">
+import os
+import logging
+from groq import AsyncGroq
+
+logger = logging.getLogger(__name__)
+
+async def correct_transcript(raw_text: str) -> str:
+    """
+    AI Agent (using Groq): Fixes misspellings, punctuation, and grammar 
+    errors from the automated transcription without changing meaning.
+    """
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        logger.warning("GROQ_API_KEY missing. Returning raw transcript uncorrected.")
+        return raw_text
+
+    # Groq uses an almost identical interface to OpenAI
+    client = AsyncGroq(api_key=api_key)
+
+    system_prompt = (
+        "You are a silent editing agent. Fix obvious spelling mistakes, "
+        "grammar errors, and punctuation from this speech-to-text transcript. "
+        "Do not add comments. Do not summarize. Return only the corrected text."
+    )
+
+    try:
+        response = await client.chat.completions.create(
+            # Using Llama 3 8B because it is blazing fast for simple editing tasks
+            model="llama3-8b-8192", 
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": raw_text},
+            ],
+            temperature=0.2,
+        )
+        corrected = response.choices[0].message.content.strip()
+        return corrected
+    except Exception as e:
+        logger.error("Groq Agent correction failed: %s", e)
+        return raw_text  # Fallback: store uncorrected if agent fails
+</file>
+
+<file path="src/integrations/supabase_client.py">
+import logging
+import os
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
+
+from supabase import Client, create_client
+
+logger = logging.getLogger(__name__)
+
+_BUCKET = "memoir-media"
+_UPLOAD_TTL_SECONDS = 60 * 10
+_READ_TTL_SECONDS = 60 * 60
+
+
+def get_supabase() -> Client:
+    url = os.environ["SUPABASE_URL"]
+    key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+    return create_client(url, key)
+
+
+def build_storage_key(memoir_id: str, kind: str, mime_type: str) -> str:
+    """Build a unique key scoped below the memoir and media kind."""
+    ext = _mime_to_ext(mime_type)
+    return f"{memoir_id}/{kind}/{uuid4()}.{ext}"
+
+
+def _signed_url(response: object) -> str:
+    """Support the response key names used by Supabase client versions."""
+    if isinstance(response, dict):
+        value = response.get("signedURL") or response.get("signed_url")
+        if isinstance(value, str) and value:
+            return value
+
+    for attribute in ("signedURL", "signed_url"):
+        value = getattr(response, attribute, None)
+        if isinstance(value, str) and value:
+            return value
+
+    raise RuntimeError("Supabase did not return a signed URL.")
+
+
+def create_upload_url(storage_key: str) -> tuple[str, datetime]:
+    client = get_supabase()
+    response = client.storage.from_(_BUCKET).create_signed_upload_url(storage_key)
+    expires_at = datetime.now(timezone.utc) + timedelta(
+        seconds=_UPLOAD_TTL_SECONDS
+    )
+    return _signed_url(response), expires_at
+
+
+def create_read_url(storage_key: str) -> str:
+    """Return a private, time-limited URL for image/audio playback."""
+    client = get_supabase()
+    response = client.storage.from_(_BUCKET).create_signed_url(
+        storage_key,
+        _READ_TTL_SECONDS,
+    )
+    return _signed_url(response)
+
+
+def delete_object(storage_key: str) -> None:
+    client = get_supabase()
+    client.storage.from_(_BUCKET).remove([storage_key])
+
+
+_EXT_MAP = {
+    "audio/webm": "webm",
+    "audio/mpeg": "mp3",
+    "audio/mp4": "m4a",
+    "audio/wav": "wav",
+    "audio/ogg": "ogg",
+    "audio/aac": "aac",
+    "audio/x-m4a": "m4a",
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+}
+
+
+def _mime_to_ext(mime_type: str) -> str:
+    base_mime = mime_type.split(";")[0].strip().lower()
+    ext = _EXT_MAP.get(base_mime)
+
+    if ext:
+        return ext
+    if "webm" in base_mime:
+        return "webm"
+    if "mp4" in base_mime or "m4a" in base_mime:
+        return "m4a"
+    if "wav" in base_mime:
+        return "wav"
+    if "mpeg" in base_mime or "mp3" in base_mime:
+        return "mp3"
+
+    raise ValueError(f"Unsupported mime type: {mime_type}")
+</file>
+
+<file path="src/models/example_models.py">
+# Pydantic models = the request/response "shape" for a feature.
+# One models file per feature, matching the name used in api/ and domain/.
+
+from pydantic import BaseModel, Field
+from typing import Optional
+
+
+class GreetingRequest(BaseModel):
+    name: str = Field(..., description="Name of the person to greet")
+    excited: Optional[bool] = Field(default=False, description="Whether to add an exclamation mark")
+
+
+class GreetingResponse(BaseModel):
+    message: str
+    success: bool
+    error: Optional[str] = None
+</file>
+
+<file path="src/models/memoir_models.py">
+from datetime import datetime, date
+from typing import Literal, Optional
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field
+from enum import Enum
+
+
+class RelationshipGroup(str, Enum):
+    spouse_partner = "spouse_partner"
+    child = "child"
+    grandchild = "grandchild"
+    sibling = "sibling"
+    parent = "parent"
+    extended_family = "extended_family"
+    friend = "friend"
+    colleague = "colleague"
+    neighbour = "neighbour"
+    self = "self"
+    other = "other"
+
+
+class MemoirCreateRequest(BaseModel):
+    subject_name: str = Field(..., min_length=1, max_length=200)
+    birth_year: Optional[int] = Field(None, ge=1800, le=2100)
+    end_year: Optional[int] = Field(None, ge=1800, le=2100)
+    is_living: bool
+    relationship: RelationshipGroup
+
+
+class MemoirOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    subject_name: str
+    subject_born_on: Optional[date] = None
+    subject_died_on: Optional[date] = None
+    subject_is_living: bool
+    description: Optional[str] = None   # NEW
+    status: str
+    created_at: datetime
+
+
+class ContributorOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    email: Optional[str] = None
+    display_name: str
+    role: Literal["Admin", "Contributor"]
+    status: Literal["Accepted", "Pending"]
+</file>
+
+<file path="src/models/memory_models.py">
+# Pydantic models for the memory feature — direct twin of the frontend schemas.
+# Strictly mapped to the official SQL schema.
+
+from datetime import datetime
+from enum import Enum
+from typing import Optional, List
+from uuid import UUID
+from pydantic import BaseModel, Field, ConfigDict
+
+
+class MemoryStatus(str, Enum):
+    draft = "draft"
+    submitted = "submitted"
+
+
+class MediaKind(str, Enum):
+    audio = "audio"
+    photo = "photo"
+
+
+class MediaLinkType(str, Enum):
+    primary = "primary"
+    reference = "reference"
+
+
+class TranscodeStatus(str, Enum):
+    pending = "pending"
+    processing = "processing"
+    ready = "ready"
+    failed = "failed"
+    skipped = "skipped"
+
+
+# ---------- Media ----------
+
+class PresignRequest(BaseModel):
+    kind: MediaKind
+    mime_type: str = Field(..., max_length=100)
+    byte_size: int = Field(..., gt=0, le=50 * 1024 * 1024)  # 50 MB hard limit
+    original_filename: Optional[str] = Field(None, max_length=255)
+    checksum_sha256: Optional[str] = Field(None, min_length=64, max_length=64)
+
+
+class PresignResponse(BaseModel):
+    upload_url: str
+    storage_key: str
+    expires_at: datetime
+
+
+class MediaConfirmRequest(BaseModel):
+    storage_key: str
+    kind: MediaKind
+    mime_type: str
+    byte_size: int = Field(..., gt=0)
+    duration_ms: Optional[int] = Field(None, ge=0)  # Required for audio by DB constraint
+    width_px: Optional[int] = Field(None, ge=0)
+    height_px: Optional[int] = Field(None, ge=0)
+    caption: Optional[str] = Field(None, max_length=1000)
+    original_filename: Optional[str] = Field(None, max_length=255)
+    checksum_sha256: Optional[str] = Field(None, min_length=64, max_length=64)
+
+
+class MediaAssetOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    memoir_id: UUID
+    kind: MediaKind
+    storage_key: str
+    mime_type: str
+    byte_size: int
+    duration_ms: Optional[int] = None
+    width_px: Optional[int] = None
+    height_px: Optional[int] = None
+    caption: Optional[str] = None
+    playback_url: str
+    position: int
+    link_type: MediaLinkType = MediaLinkType.primary
+    transcription_status: TranscodeStatus
+    created_at: datetime
+
+
+# ---------- Memory ----------
+
+class MemoryCreateRequest(BaseModel):
+    title: Optional[str] = Field(None, max_length=200)
+    body_text: Optional[str] = Field(None, max_length=20_000)
+    prompt_id: Optional[UUID] = None
+
+
+class MemoryPatchRequest(BaseModel):
+    title: Optional[str] = Field(None, max_length=200)
+    body_text: Optional[str] = Field(None, max_length=20_000)
+
+
+class MemoryOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    memoir_id: UUID
+    author_participant_id: UUID
+    prompt_id: Optional[UUID] = None
+    title: Optional[str] = None
+    body_text: Optional[str] = None
+    status: MemoryStatus
+    media: List[MediaAssetOut] = []
+    created_at: datetime
+    updated_at: datetime
+    submitted_at: Optional[datetime] = None
+
+
+class MemoryListResponse(BaseModel):
+    memories: List[MemoryOut]
+    total: int
+</file>
+
+<file path="src/utils/string_helpers.py">
+# Generic helpers used across multiple features (not tied to one domain).
+
+def add_strings(a: str, b: str) -> str:
+    """Example generic utility: concatenate two strings with a space."""
+    return f"{a} {b}".strip()
+</file>
+
+<file path="src/main.py">
+import os
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from src.api.example import router as example_router
+from src.api.memoir import router as memoir_router
+from src.api.memory import router as memory_router
+from src.api.user import router as user_router
+from src.core.app_lifespan import lifespan
+from src.core.logging_config import setup_logging
+
+setup_logging()
+
+app = FastAPI(title="Memoir Backend", lifespan=lifespan)
+
+
+def get_frontend_origins() -> list[str]:
+    configured = os.getenv("FRONTEND_ORIGINS", "")
+
+    if configured.strip():
+        return [origin.strip() for origin in configured.split(",") if origin.strip()]
+
+    return [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=get_frontend_origins(),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(example_router)
+app.include_router(memoir_router)
+app.include_router(memory_router)
+app.include_router(user_router)
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+</file>
+
+</files>
