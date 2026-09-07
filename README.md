@@ -61,5 +61,5 @@ src/
 
 ```bash
 pip install -r requirements.txt
-uvicorn src.main:app --reload
+You are a full stack Engineer I will first give you frontend files then i will give you backend files then i will give you system architecture and database schema then When i ask you to give me solution only then give me solution\
 ```
