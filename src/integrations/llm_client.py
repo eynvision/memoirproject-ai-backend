@@ -14,7 +14,6 @@ async def correct_transcript(raw_text: str) -> str:
         logger.warning("GROQ_API_KEY missing. Returning raw transcript uncorrected.")
         return raw_text
 
-    # Groq uses an almost identical interface to OpenAI
     client = AsyncGroq(api_key=api_key)
 
     system_prompt = (
@@ -23,10 +22,11 @@ async def correct_transcript(raw_text: str) -> str:
         "Do not add comments. Do not summarize. Return only the corrected text."
     )
 
+    model_name = "llama-3.1-8b-instant"
+
     try:
         response = await client.chat.completions.create(
-            # Using Llama 3 8B because it is blazing fast for simple editing tasks
-            model="llama3-8b-8192", 
+            model=model_name, 
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": raw_text},
@@ -36,5 +36,5 @@ async def correct_transcript(raw_text: str) -> str:
         corrected = response.choices[0].message.content.strip()
         return corrected
     except Exception as e:
-        logger.error("Groq Agent correction failed: %s", e)
-        return raw_text  # Fallback: store uncorrected if agent fails
+        logger.warning("Groq Agent correction failed with model %s: %s", model_name, e)
+        return raw_text

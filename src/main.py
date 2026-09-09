@@ -6,10 +6,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.api.example import router as example_router
 from src.api.memoir import router as memoir_router
 from src.api.memory import router as memory_router
+from src.api.reader import router as reader_router
 from src.api.user import router as user_router
 from src.core.app_lifespan import lifespan
 from src.core.logging_config import setup_logging
-
+from src.api.export import router as export_router
 setup_logging()
 
 app = FastAPI(title="Memoir Backend", lifespan=lifespan)
@@ -38,8 +39,9 @@ app.add_middleware(
 app.include_router(example_router)
 app.include_router(memoir_router)
 app.include_router(memory_router)
+app.include_router(reader_router)
 app.include_router(user_router)
-
+app.include_router(export_router)
 
 @app.get("/health")
 async def health():
