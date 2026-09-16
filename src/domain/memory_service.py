@@ -6,8 +6,8 @@ fully decoupled from direct database infrastructure calls.
 """
 
 from fastapi import HTTPException, status
-from src.schemas.memory import MemoryCreateRequest
-from src.integrations import memory_repository
+from src.schemas.memory import MemoryCreateRequest, MemoryUpdateRequest
+from src.integrations import memory_repository, memoir_repository
 from src.domain.authorization import verify_active_participant
 from src.integrations import storage_adapter
 from src.domain.transcription_service import transcribe_and_store_audio  # <-- Import transcription service
@@ -238,3 +238,45 @@ class MemoryService:
             )
             
         return {"success": True, "message": "Memory successfully deleted."}
+
+    @classmethod
+    def update_memory(cls, memoir_id: str, memory_id: str, user_id: str, payload: MemoryUpdateRequest) -> dict:
+        """
+        Edits a memory's title/body_text from the memoir preview screen.
+        Restricted to owners/admins, and blocked once the memoir has been published.
+        """
+        verify_active_participant(
+            str(memoir_id), user_id, required_roles=["owner", "admin"]
+        )
+
+        memoir = memoir_repository.get_memoir_by_id(str(memoir_id))
+        if not memoir:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Memoir not found.")
+        if memoir.get("status") == "published":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This memoir has been published and can no longer be edited.",
+            )
+
+        try:
+            mem_res = memory_repository.fetch_memory_by_id(memory_id, memoir_id)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+        if not mem_res.data:
+            raise HTTPException(status_code=404, detail="Memory not found in this memoir.")
+
+        memory = mem_res.data[0]
+        if memory.get("deleted_at"):
+            raise HTTPException(status_code=404, detail="Memory not found in this memoir.")
+
+        updates = payload.model_dump(exclude_none=True)
+        try:
+            update_res = memory_repository.update_memory_record(memory_id, memoir_id, updates)
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to update memory: {str(e)}"
+            )
+
+        return update_res.data[0] if update_res and update_res.data else {**memory, **updates}

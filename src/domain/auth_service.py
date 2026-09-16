@@ -104,10 +104,10 @@ class AuthService:
             if isinstance(e, HTTPException):
                 raise e
 
-            logger.error(f"Unexpected Supabase auth registration error for {email}: {str(e)}")
+            logger.warning(f"Supabase auth registration failed for {email}: {str(e)}")
             raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Supabase auth registration failed: {str(e)}"
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Registration failed: {str(e)}"
             )
             
     @staticmethod
@@ -128,6 +128,7 @@ class AuthService:
         try:
             response = auth_repository.auth_sign_in(payload.email, payload.password)
         except Exception as e:
+            logger.warning(f"Login failed for {payload.email}: {str(e)}")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=f"Invalid email or password: {str(e)}"

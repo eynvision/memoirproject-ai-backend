@@ -72,10 +72,9 @@ class CommentsRepository:
                 "body": payload["body"].strip()
             }
 
-            # Insert and select only the comment record itself (no embedded joins)
+            # Insert and return the created comment row directly
             response = supabase_admin.table("comment")\
                 .insert(insert_data)\
-                .select("*")\
                 .execute()
 
             data = response.data or []

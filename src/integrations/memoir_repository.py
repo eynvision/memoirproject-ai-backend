@@ -48,3 +48,9 @@ def insert_memoir_participant(participant_data: dict):
 def delete_memoir_record(memoir_id: str):
     """Deletes an orphan memoir during a failed transaction rollback."""
     return supabase_admin.table("memoir").delete().eq("id", memoir_id).execute()
+
+
+def get_memoir_by_id(memoir_id: str) -> dict | None:
+    """Fetches the memoir container row, used to check memoir.status (e.g. before allowing edits)."""
+    res = supabase_admin.table("memoir").select("*").eq("id", memoir_id).execute()
+    return res.data[0] if res.data else None

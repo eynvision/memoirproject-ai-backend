@@ -27,6 +27,8 @@ from src.api.comments import router as comment_router
 from src.api.search import router as search_router
 from src.api.export import router as export_router
 from src.api.transcripts import router as transcript_router
+from src.api.chapter import router as chapter_router
+from src.api.memoir_memory import router as memoir_memory_router
 
 def setup_logging():
     """Configures root logging format and log level for backend services."""
@@ -92,5 +94,7 @@ app.include_router(comment_router)
 app.include_router(search_router)
 app.include_router(export_router)
 app.include_router(transcript_router)
+app.include_router(chapter_router)
+app.include_router(memoir_memory_router)
 app.include_router(owner_router)
 app.include_router(reader_router)
