@@ -42,14 +42,14 @@ class ShareRepository:
     @staticmethod
     async def insert_link(insert_data: Dict[str, Any]) -> Dict[str, Any]:
         # Token and defaults are generated automatically by your Postgres schema
-        res = supabase_admin.table("memoir_link").insert(insert_data).select("*").execute()
+        res = supabase_admin.table("memoir_link").insert(insert_data).execute()
         if not res.data:
             raise HTTPException(status_code=400, detail="Failed to create share link")
         return res.data[0]
 
     @staticmethod
     async def update_link(link_id: str, update_data: Dict[str, Any]) -> Dict[str, Any]:
-        res = supabase_admin.table("memoir_link").update(update_data).eq("id", link_id).select("*").execute()
+        res = supabase_admin.table("memoir_link").update(update_data).eq("id", link_id).execute()
         return res.data[0]
 
     @staticmethod
