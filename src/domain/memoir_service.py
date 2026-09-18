@@ -99,3 +99,37 @@ class MemoirService:
             )
             
         return created_memoir
+    
+    @staticmethod
+    def get_user_memoirs(user_session: dict) -> list:
+        """
+        Validates user session and fetches all memoirs created by the user.
+
+        Args:
+            user_session (dict): The active user session dictionary containing the user ID.
+
+        Returns:
+            list: A list of memoir dictionaries.
+
+        Raises:
+            HTTPException (401): If the user session is missing a valid user ID.
+            HTTPException (500): If the database query fails.
+        """
+        user_id = user_session.get("user_id")
+
+        if not user_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="User session is missing user ID."
+            )
+
+        try:
+            db_response = memoir_repository.fetch_user_memoirs(user_id)
+            return db_response.data if db_response and db_response.data else []
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Database error while fetching memoirs: {str(e)}"
+            )
+    
+    

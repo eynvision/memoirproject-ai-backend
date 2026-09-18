@@ -61,7 +61,7 @@ class ShareRepository:
         res = supabase_admin.table("memory")\
             .select("*, memory_media(*, media_asset(*))")\
             .eq("memoir_id", memoir_id)\
-            .eq("status", "saved")\
+            .eq("status", "draft")\
             .is_("deleted_at", None)\
             .order("created_at", desc=True)\
             .execute()

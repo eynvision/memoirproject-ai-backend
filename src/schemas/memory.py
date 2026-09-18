@@ -6,7 +6,7 @@ enforcing strict status literals.
 
 import uuid
 from datetime import date
-from typing import Optional, Literal, List
+from typing import Optional, Literal, List,Any
 from pydantic import BaseModel, Field
 
 class MemoryCreateRequest(BaseModel):
@@ -38,3 +38,14 @@ class MemoryCreateRequest(BaseModel):
     media_asset_ids: Optional[List[uuid.UUID]] = Field(
         default_factory=list, description="List of media asset UUIDs linked to this memory"
     )
+class MemoryResponse(BaseModel):
+    id: uuid.UUID
+    memoir_id: uuid.UUID
+    title: Optional[str] = None
+    body_text: Optional[str] = None
+    occurred_start: Optional[date] = None
+    # ... your other existing fields ...
+    
+    # ADD THIS CRITICAL LINE:
+    # This tells FastAPI NOT to strip the media_assets array that your get_memoir_feed function created
+    media_assets: Optional[List[Any]] = Field(default=[], description="Hydrated media assets with playback URLs")

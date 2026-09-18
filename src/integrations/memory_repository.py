@@ -43,14 +43,14 @@ def fetch_memoir_feed_records(memoir_id: str, limit: int = 20, offset: int = 0):
         .select(
             "id, memoir_id, author_participant_id, title, body_text, status, "
             "occurred_start, occurred_end, occurred_precision, date_source, created_at, "
-            "memory_media(media_asset(*))"
+            "chapter_id, memory_media(media_asset(*))"
         ) \
         .eq("memoir_id", memoir_id) \
         .is_("deleted_at", "null") \
         .order("created_at", desc=True) \
         .range(offset, end_index) \
         .execute()
-        
+                
 def fetch_memory_by_id(memory_id: str, memoir_id: str):
     """
     Fetches status metadata for a specific memory record strictly scoped by memoir_id 

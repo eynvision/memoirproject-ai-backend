@@ -2,6 +2,7 @@ from pydantic import BaseModel, Field, model_validator
 from typing import Optional, Literal
 from datetime import date
 import uuid
+from typing import List
 
 class MemoirCreateRequest(BaseModel):
     subject_name: str = Field(..., description="Name of the subject of the memoir")
@@ -46,3 +47,9 @@ class MemoirResponseEnvelope(BaseModel):
     success: bool = True
     message: str = "Operation successful"
     data: MemoirResponseData
+    
+class MemoirListResponseEnvelope(BaseModel):
+    """Consistent API response envelope for returning multiple memoirs."""
+    success: bool = True
+    message: str = "Operation successful"
+    data: List[MemoirResponseData]

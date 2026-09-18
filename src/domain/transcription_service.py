@@ -1,22 +1,20 @@
 import os
 import time
-import assemblyai as aai
-# Add this import at the top:
+from groq import Groq
 from src.integrations.memory_repository import upsert_transcript_record
 from src.integrations.supabase_client import supabase_admin
 
 def transcribe_and_store_audio(media_asset_id: str, memoir_id: str, storage_key: str):
     """
     Downloads audio binary from Supabase storage using admin client with retries, 
-    uploads raw bytes directly to AssemblyAI, and persists the resulting transcript.
+    uploads raw bytes directly to Groq Whisper, and persists the resulting transcript.
     """
-    api_key = os.getenv("ASSEMBLYAI_API_KEY")
+    api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
-        print("CRITICAL ERROR: ASSEMBLYAI_API_KEY is missing from environment variables!")
-        raise ValueError("ASSEMBLYAI_API_KEY is missing")
+        print("CRITICAL ERROR: GROQ_API_KEY is missing from environment variables!")
+        raise ValueError("GROQ_API_KEY is missing")
 
-    aai.settings.api_key = api_key
-    transcriber = aai.Transcriber()
+    groq_client = Groq(api_key=api_key)
 
     try:
         bucket_name = "media-bucket"  
@@ -38,15 +36,18 @@ def transcribe_and_store_audio(media_asset_id: str, memoir_id: str, storage_key:
         if not audio_bytes:
             raise Exception(f"Download returned empty bytes or 404 after retries for key: {storage_key}")
 
-        print("Uploading raw audio bytes to AssemblyAI...")
-        upload_url = transcriber.upload_file(audio_bytes)
-
-        print(f"Uploaded successfully. Transcribing URL...")
-        transcript_result = transcriber.transcribe(upload_url)
+        print("Uploading raw audio bytes to Groq Whisper API...")
         
-        if transcript_result.status == aai.TranscriptStatus.error:
-            raise Exception(f"AssemblyAI processing failed: {transcript_result.error}")
-
+        # Groq requires a filename with a recognized extension to parse the format
+        extension = storage_key.split('.')[-1] if '.' in storage_key else 'webm'
+        
+        transcript_result = groq_client.audio.transcriptions.create(
+            file=(f"audio.{extension}", audio_bytes),
+            model="whisper-large-v3-turbo",
+            response_format="json",
+            language="en" # Omit this if you want Whisper to auto-detect mixed languages
+        )
+        
         raw_text = transcript_result.text or ""
         print(f"Transcription successful! Text: {raw_text[:60]}...")
 
@@ -54,10 +55,12 @@ def transcribe_and_store_audio(media_asset_id: str, memoir_id: str, storage_key:
             "media_asset_id": media_asset_id,
             "memoir_id": memoir_id,
             "raw_text": raw_text,
-            "engine": "assemblyai",
-            "confidence": transcript_result.confidence,
-            "language": transcript_result.language_code or "en"
+            "engine": "groq-whisper",
+            # Defaulting confidence to 1.0 since Groq's standard json response omits it
+            "confidence": 1.0, 
+            "language": "en"
         }
+        
         response = upsert_transcript_record(transcript_payload)
         
         print("Transcript successfully saved to database!", response.data)

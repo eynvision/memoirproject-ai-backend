@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from src.core.config import settings
 from src.api.share import owner_router, reader_router
-
+from src.api.organization import organization_router
 # CRITICAL: load_dotenv() must be called BEFORE any other application modules 
 # are imported so database and storage configurations can read environment variables.
 load_dotenv()  
@@ -94,3 +94,4 @@ app.include_router(export_router)
 app.include_router(transcript_router)
 app.include_router(owner_router)
 app.include_router(reader_router)
+app.include_router(organization_router)

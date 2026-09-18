@@ -10,9 +10,8 @@ from src.schemas.memory import MemoryCreateRequest
 from src.integrations import memory_repository
 from src.domain.authorization import verify_active_participant
 from src.integrations import storage_adapter
-from src.domain.transcription_service import transcribe_and_store_audio  # <-- Import transcription service
-from src.integrations.supabase_client import supabase  # <-- Required for querying transcript table directly if needed
-
+from src.domain.transcription_service import transcribe_and_store_audio  
+from src.integrations.supabase_client import supabase_admin  
 class MemoryService:
     """
     Handles business logic for memory stories, including participant security enforcement,
@@ -170,13 +169,12 @@ class MemoryService:
                     if asset.get("kind") == "audio":
                         asset_id = asset.get("id")
                         try:
-                            transcript_res = supabase.table("transcript").select("*").eq("media_asset_id", asset_id).maybe_single().execute()
+                            # CRITICAL FIX: Use supabase_admin here to bypass RLS blocks
+                            transcript_res = supabase_admin.table("transcript").select("*").eq("media_asset_id", asset_id).maybe_single().execute()
                             asset["transcript"] = transcript_res.data if transcript_res and transcript_res.data else None
-                        except Exception:
+                        except Exception as e:
+                            print(f"Transcript fetch failed for {asset_id}: {e}")
                             asset["transcript"] = None
-                    else:
-                        asset["transcript"] = None
-
                     media_list.append(asset)
             
             mem["media_assets"] = media_list

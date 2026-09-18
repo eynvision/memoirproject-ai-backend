@@ -48,3 +48,15 @@ def insert_memoir_participant(participant_data: dict):
 def delete_memoir_record(memoir_id: str):
     """Deletes an orphan memoir during a failed transaction rollback."""
     return supabase_admin.table("memoir").delete().eq("id", memoir_id).execute()
+
+def fetch_user_memoirs(user_id: str):
+    """
+    Fetches all root memoir containers created by the user.
+
+    Args:
+        user_id (str): The unique identifier of the user account.
+
+    Returns:
+        Any: The database response object containing a list of memoir records.
+    """
+    return supabase_admin.table("memoir").select("*").eq("created_by_user_id", user_id).execute()

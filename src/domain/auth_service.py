@@ -21,26 +21,13 @@ class AuthService:
     credentials and internal application profile records through repository adapters.
     """
 
-    from src.integrations import auth_repository
-from fastapi import HTTPException, status
-
-class AuthService:
-
     @classmethod
     def register_user(cls, payload: UserRegisterRequest) -> dict:
-        """
-        Registers a new user via Supabase Auth, provisions their profile metadata, 
-        and explicitly syncs an entry into the public `user_account` database table.
-
-        Args:
-            payload (UserRegisterRequest): The registration request payload containing email, password, and full name.
-        """
         email = payload.email
         password = payload.password
         full_name = payload.full_name
 
         try:
-            # 1. Delegate auth registration to the repository layer
             response = auth_repository.auth_sign_up(
                 email=email,
                 password=password,
@@ -53,35 +40,28 @@ class AuthService:
             if not user:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Registration failed. User object not returned."
+                    detail="We couldn't complete your registration. Please try again."
                 )
 
+            # CRITICAL FIX: Catch the Supabase "Fake Success" for duplicate emails
+            # If a user already exists, Supabase returns a user object but empties their identities array
+            if hasattr(user, "identities") and user.identities is not None:
+                if len(user.identities) == 0:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="An account with this email already exists. Please login instead."
+                    )
+
             user_id = str(user.id)
-
             
-            # Edge Case 2: Email confirmation enabled -> session is None
-            if not session:
-                logger.info(f"Registration successful for {email}. Email confirmation pending.")
-                return {
-                    "success": True,
-                    "message": "Registration successful! Please check your email to confirm your account before signing in.",
-                    "requires_confirmation": True,
-                    "access_token": None,
-                    "user": {
-                        "id": user_id,
-                        "email": email,
-                        "full_name": full_name
-                    }
-                }
-
-            # Normal immediate login session
+            # ... (Keep the rest of your normal immediate login session code the same)
             logger.info(f"User successfully registered and authenticated: {email}")
             return {
                 "success": True,
                 "message": "Registration successful.",
                 "requires_confirmation": False,
-                "access_token": session.access_token,
-                "refresh_token": session.refresh_token,
+                "access_token": session.access_token if session else None,
+                "refresh_token": session.refresh_token if session else None,
                 "user": {
                     "id": user_id,
                     "email": email,
@@ -90,24 +70,48 @@ class AuthService:
             }
 
         except Exception as e:
+            # If it's our clean HTTPException from above, re-raise it so the frontend sees it
+            if isinstance(e, HTTPException):
+                raise e
+            
             error_msg = str(e).lower()
             
-            # Edge Case 1: Catch duplicate email errors and return 409 Conflict instead of 500
+            # Catch duplicate email errors and return 409 Conflict
             if "already registered" in error_msg or "already exists" in error_msg or "user already registered" in error_msg:
                 logger.warning(f"Registration attempt failed - email already in use: {email}")
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
-                    detail="This email is already registered. Please sign in or use a different email address."
+                    detail="An account with this email already exists. Please login instead."
                 )
             
-            # If it's already an HTTPException, re-raise it directly
-            if isinstance(e, HTTPException):
-                raise e
+            # Catch actual invalid formats
+            if "invalid email" in error_msg:
+                logger.warning(f"Registration failed due to invalid email address: {email}")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid email address format. Please check for typos."
+                )
 
+            # Catch Supabase SMTP / rate limit issues separately
+            if "error sending confirmation email" in error_msg or "rate limit" in error_msg:
+                logger.error(f"Supabase email delivery failure for {email}: {error_msg}")
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="We are experiencing high traffic and couldn't send your confirmation email. Please try again in a few minutes."
+                )
+                
+            # Catch weak passwords
+            if "password should be" in error_msg:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Your password is too weak. Please use at least 6 characters."
+                )
+
+            # Log the technical error securely on the backend, but show a clean message to the user
             logger.error(f"Unexpected Supabase auth registration error for {email}: {str(e)}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Supabase auth registration failed: {str(e)}"
+                detail="Unable to create your account right now. Please check your details and try again."
             )
             
     @staticmethod
@@ -128,15 +132,16 @@ class AuthService:
         try:
             response = auth_repository.auth_sign_in(payload.email, payload.password)
         except Exception as e:
+            logger.warning(f"Login failed for {payload.email}: {str(e)}")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=f"Invalid email or password: {str(e)}"
+                detail="Invalid email or password. Please check your credentials and try again."
             )
 
         if not response or not response.session or not response.user:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid email or password."
+                detail="Invalid email or password. Please check your credentials and try again."
             )
 
         user_id = response.user.id
@@ -146,7 +151,6 @@ class AuthService:
         try:
             auth_repository.update_last_login(user_id, datetime.now(timezone.utc).isoformat())
         except Exception as db_err:
-            # Non-blocking log using proper logger instead of print
             logger.warning("Failed to update last login timestamp: %s", str(db_err))
 
         return {

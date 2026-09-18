@@ -26,7 +26,6 @@ def _to_link_response(link: Dict[str, Any]) -> ShareLinkResponse:
         revoked_at=link.get("revoked_at"),
         open_count=link.get("open_count", 0)
     )
-
 # --- OWNER ROUTES ---
 @owner_router.post("/{memoir_id}/share-link", status_code=201, response_model=ShareLinkResponseEnvelope)
 async def create_share_link(memoir_id: str, current_user: dict = Depends(get_current_user)):
@@ -46,7 +45,7 @@ async def delete_share_link(memoir_id: str, current_user: dict = Depends(get_cur
     await ShareService.revoke_share_link(memoir_id, user_id)
     return {"success": True, "message": "Share link revoked."}
 
-# --- READER ROUTE (Replaces the need for a separate deps_share.py) ---
+# --- READER/CONTRIBUTOR ROUTE ---
 @reader_router.get("/{token}", response_model=SharedMemoirResponseEnvelope)
 async def read_shared_memoir(token: str):
     link = await ShareRepository.get_link_by_token(token)
@@ -61,8 +60,8 @@ async def read_shared_memoir(token: str):
             raise HTTPException(status_code=404, detail="Link expired.")
 
     memoir = await ShareRepository.get_memoir_by_id(link["memoir_id"])
-    if not memoir or memoir.get("status") != "published":
-        raise HTTPException(status_code=404, detail="Not found.")
+    if not memoir:
+        raise HTTPException(status_code=404, detail="Memoir not found.")
 
     # Increment the open count in the background
     await ShareRepository.increment_open_count(link["id"], link.get("open_count", 0))

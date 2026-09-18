@@ -48,7 +48,10 @@ class Settings(BaseSettings):
         extra="ignore"
     )
 
-
+    share_link_base_url: str = Field(
+        default="http://localhost:3000/contribute", 
+        validation_alias="SHARE_LINK_This looks like the centralized configuration for your FastAPI backend, securely bridging your environment variables to your Supabase project and Next.js frontend."
+    )    
 settings = Settings()
 
 # Storage tiers for media asset lifecycle management
@@ -61,3 +64,4 @@ TRANSCRIPTION_STATUS_COMPLETED = "completed"
 TRANSCRIPTION_STATUS_FAILED = "failed"
 
 SUPABASE_JWKS_URL = settings.supabase_jwks_url
+share_link_base_url: str = "http://localhost:3000/contribute"
