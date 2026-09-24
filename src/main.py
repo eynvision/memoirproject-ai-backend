@@ -18,7 +18,11 @@ from src.api.comments import router as comment_router
 from src.api.search import router as search_router
 from src.api.export import router as export_router
 from src.api.transcripts import router as transcript_router
-from src.api.chapters import router as chapter_router
+from src.api.chapters import router as chapter_proposal_router
+from src.api.chapter import router as chapter_router
+from src.api.memoir_memory import router as memoir_memory_router
+from src.api.narrative import router as narrative_router
+from src.api.chat import router as chat_router
 
 def setup_logging():
     logging.basicConfig(
@@ -70,4 +74,8 @@ app.include_router(export_router)
 app.include_router(transcript_router)
 app.include_router(owner_router)
 app.include_router(reader_router)
+app.include_router(chapter_proposal_router)
 app.include_router(chapter_router)
+app.include_router(memoir_memory_router)
+app.include_router(narrative_router)
+app.include_router(chat_router)
