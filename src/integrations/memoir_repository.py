@@ -117,3 +117,32 @@ def fetch_live_memoir_data(memoir_id: str):
         "participants": participants,
         "photos": photos,
     }
+
+
+def get_memoir_by_id(memoir_id: str) -> dict | None:
+    """Fetches the memoir container row, used to check memoir.status (e.g. before allowing edits)."""
+    res = supabase_admin.table("memoir").select("*").eq("id", memoir_id).execute()
+    return res.data[0] if res.data else None
+
+
+def fetch_memoirs_for_user(user_id: str) -> list:
+    """
+    Fetches every memoir the given user is an active (non-removed) participant
+    of, most recently created first.
+    """
+    res = supabase_admin.table("memoir_participant") \
+        .select("role, memoir:memoir_id(*)") \
+        .eq("user_id", user_id) \
+        .is_("removed_at", "null") \
+        .execute()
+
+    memoirs = []
+    for row in res.data or []:
+        memoir = row.get("memoir")
+        if not memoir:
+            continue
+        memoir["role"] = row.get("role")
+        memoirs.append(memoir)
+
+    memoirs.sort(key=lambda m: m.get("created_at") or "", reverse=True)
+    return memoirs

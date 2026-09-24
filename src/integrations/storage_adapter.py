@@ -100,7 +100,7 @@ def object_exists(key: str) -> int | None:
     return None
 
 
-def create_playback_url(key: str) -> str | None:
+def create_playback_url(key: str, ttl: int | None = None) -> str | None:
     """Bucket is public, so build the public URL directly instead of
     depending on the signed-url response shape (which varies by SDK version
     and was silently returning None)."""

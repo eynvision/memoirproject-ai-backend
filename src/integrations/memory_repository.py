@@ -53,11 +53,11 @@ def fetch_memoir_feed_records(memoir_id: str, limit: int = 20, offset: int = 0):
         
 def fetch_memory_by_id(memory_id: str, memoir_id: str):
     """
-    Fetches status metadata for a specific memory record strictly scoped by memoir_id 
-    to prevent cross-tenant data probing.
+    Fetches a memory record strictly scoped by memoir_id to prevent
+    cross-tenant data probing.
     """
     return supabase_admin.table("memory") \
-        .select("memoir_id, status") \
+        .select("id, memoir_id, title, body_text, rewritten_text, status, deleted_at") \
         .eq("id", memory_id) \
         .eq("memoir_id", memoir_id) \
         .execute()
@@ -93,6 +93,19 @@ def soft_delete_memory_record(memory_id: str, memoir_id: str):
     now = datetime.now(timezone.utc).isoformat()
     return supabase_admin.table("memory") \
         .update({"deleted_at": now}) \
+        .eq("id", memory_id) \
+        .eq("memoir_id", memoir_id) \
+        .execute()
+
+def update_memory_record(memory_id: str, memoir_id: str, updates: dict):
+    """
+    Updates editable fields (e.g. title, body_text) on a memory record,
+    strictly scoped by both ID and memoir_id to prevent cross-tenant writes.
+    """
+    from datetime import datetime, timezone
+    payload = {**updates, "updated_at": datetime.now(timezone.utc).isoformat()}
+    return supabase_admin.table("memory") \
+        .update(payload) \
         .eq("id", memory_id) \
         .eq("memoir_id", memoir_id) \
         .execute()

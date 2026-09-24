@@ -11,6 +11,21 @@ from src.core.auth import get_current_user
 
 router = APIRouter(prefix="/api/memoirs", tags=["Memoirs"])
 
+@router.get("/mine", status_code=status.HTTP_200_OK)
+def list_my_memoirs(current_user: dict = Depends(get_current_user)):
+    """
+    Lists every memoir the current user is an active participant of, so the
+    frontend can recover an active memoir after login without relying on
+    client-side cache from a prior signup/onboarding flow.
+    """
+    user_id = current_user.get("user_id") or current_user.get("id") or current_user.get("sub")
+    memoirs = MemoirService.list_my_memoirs(user_id)
+    return {
+        "success": True,
+        "message": "Operation successful.",
+        "data": memoirs,
+    }
+
 @router.post("/", status_code=status.HTTP_201_CREATED, response_model=MemoirResponseEnvelope)
 def create_memoir(
     payload: MemoirCreateRequest,
