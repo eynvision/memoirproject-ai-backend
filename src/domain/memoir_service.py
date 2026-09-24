@@ -146,3 +146,23 @@ class MemoirService:
             "chapters": chapters,
             "memories": hydrated_memories
         }
+
+    @staticmethod
+    def list_my_memoirs(user_id: str) -> list:
+        """
+        Returns every memoir the user is an active participant of, so a
+        returning user can recover their memoir after logging in on a
+        browser/session with no cached active memoir.
+        """
+        if not user_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="User session is missing user ID."
+            )
+        try:
+            return memoir_repository.fetch_memoirs_for_user(user_id)
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to fetch memoirs for user: {str(e)}"
+            )
