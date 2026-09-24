@@ -7,7 +7,7 @@ enforcing strict status literals.
 import uuid
 from datetime import date
 from typing import Optional, Literal, List
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 class MemoryCreateRequest(BaseModel):
     """
@@ -38,3 +38,19 @@ class MemoryCreateRequest(BaseModel):
     media_asset_ids: Optional[List[uuid.UUID]] = Field(
         default_factory=list, description="List of media asset UUIDs linked to this memory"
     )
+
+
+class MemoryUpdateRequest(BaseModel):
+    """
+    Validation schema for editing an existing memory's title/body_text
+    (e.g. from the memoir preview screen, before publication). At least
+    one field must be provided.
+    """
+    title: Optional[str] = Field(None, max_length=255, description="Title of the memory")
+    body_text: Optional[str] = Field(None, max_length=10000, description="Rich text content of the memory")
+
+    @model_validator(mode="after")
+    def require_at_least_one_field(self):
+        if self.title is None and self.body_text is None:
+            raise ValueError("At least one of title or body_text must be provided.")
+        return self
