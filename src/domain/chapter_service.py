@@ -1,364 +1,379 @@
-# src/domain/chapter_service.py
-import json
-import os
-import httpx
-from fastapi import HTTPException
-from src.core.config import settings
-from src.integrations.chapter_repository import (
-    get_memories_for_organization,
-    get_existing_chapters,
-    apply_chapters_to_db,
+"""
+@file chapter_service.py
+@description Business logic for AI memoir organisation: fetching and
+normalising memories, running the LangChain suggestion job, validating the
+AI's structured output before anything is saved, then exposing review,
+reorder, and publish operations. The AI only suggests; humans approve.
+"""
+
+import logging
+from datetime import datetime, timezone
+from typing import List, Optional
+
+from fastapi import HTTPException, status
+
+from src.core.config import CHAPTER_MAX_LIMIT, CHAPTER_MIN_LIMIT, CHAPTER_PHOTO_URL_TTL
+from src.schemas.chapter import (
+    ChapterUpdateRequest,
+    GenerationStatusData,
+    MemoryInputItem,
+)
+from src.domain.authorization import verify_active_participant
+from src.domain.memory_input import normalize_memories as _normalize_memories
+from src.domain.narrative_service import NarrativeService
+from src.integrations import chapter_repository, memoir_repository, storage_adapter
+from src.integrations.memoir_organiser_chain import (
+    MemoirOrganiserChain,
+    MemoirOrganisationResult,
 )
 
-
-class MCPServer:
-    def __init__(self, memoir_id: str):
-        self.memoir_id = memoir_id
-
-    def get_resource(self, resource_name: str):
-        if resource_name == "memories":
-            return get_memories_for_organization(self.memoir_id)
-        if resource_name == "chapters":
-            return get_existing_chapters(self.memoir_id)
-        raise ValueError(f"Unknown resource {resource_name}")
-
-    def execute_tool(self, tool_name: str, payload: dict):
-        if tool_name == "propose_chapter_set":
-            return payload
-        raise ValueError(f"Unknown tool {tool_name}")
-
-
-class MCPClient:
-    def __init__(self, server: MCPServer):
-        self.server = server
-
-    def read_resource(self, name: str):
-        return self.server.get_resource(name)
-
-    def call_tool(self, name: str, payload: dict):
-        return self.server.execute_tool(name, payload)
-
-
-def _call_llm_json(prompt: str) -> dict | None:
-    api_key = settings.llm_api_key or os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        print("LLM Error: No API key found in environment.")
-        return None
-
-    base_url = (settings.llm_base_url or "https://api.groq.com/openai/v1").rstrip("/")
-    endpoint = f"{base_url}/chat/completions"
-
-    candidate_models = [
-        settings.llm_model,
-        "llama-3.3-70b-versatile",
-        "llama-3.1-8b-instant",
-        "openai/gpt-oss-120b",
-        "meta-llama/llama-4-scout-17b-16e-instruct",
-        "qwen/qwen3-32b",
-        "moonshotai/kimi-k2-instruct",
-    ]
-    models_to_try = []
-    for m in candidate_models:
-        if m and m not in models_to_try:
-            models_to_try.append(m)
-
-    for model in models_to_try:
-        payload = {
-            "model": model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a master biographer and memoir editor. "
-                        "Always respond with valid JSON only. No markdown, no code fences."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.6, # Slightly increased for better creative flow
-        }
-        if "groq" in base_url or "openai" in base_url:
-            payload["response_format"] = {"type": "json_object"}
-
-        try:
-            response = httpx.post(
-                endpoint,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=60.0,
-            )
-            if response.status_code == 200:
-                content = response.json()["choices"][0]["message"]["content"].strip()
-                if content.startswith("```json"):
-                    content = content[7:]
-                if content.startswith("```"):
-                    content = content[3:]
-                if content.endswith("```"):
-                    content = content[:-3]
-                return json.loads(content.strip())
-            print(f"LLM API Warning ({response.status_code}) model='{model}': {response.text[:300]}")
-        except Exception as err:
-            print(f"LLM Call error for model '{model}': {err}")
-
-    return None
-
-
-def _fallback_summary(facts: list) -> str:
-    """Build a beautifully flowing fallback paragraph from the actual memory texts."""
-    snippets = []
-    for f in facts:
-        text = (f.get("story_content") or f.get("title") or "").strip()
-        if text:
-            cut = text.replace("\n", " ")
-            if len(cut) > 200:
-                cut = cut[:200].rsplit(" ", 1)[0] + "…"
-            snippets.append(cut)
-    if not snippets:
-        return "A collection of treasured family moments from this period of life. Every story preserved here adds a vital piece to the larger, beautiful puzzle of their journey."
-    joined = " ".join(snippets)
-    if len(joined) > 800:
-        joined = joined[:800].rsplit(" ", 1)[0] + "…"
-    return joined
-
-
-def _fallback_title(era: str, facts: list) -> str:
-    if facts:
-        t = (facts[0].get("title") or "").strip()
-        if t and len(t) < 60:
-            return t.title() if t.islower() else t
-    clean = (era or "Memories").replace("The ", "").strip()
-    return f"Memories of the {clean}" if clean[0].isdigit() else clean
-
-
-class ReaderAgent:
-    def __init__(self, client: MCPClient):
-        self.client = client
-
-    def extract_facts(self):
-        memories = self.client.read_resource("memories")
-        
-        # Sort chronologically to help the LLM establish a natural, ascending timeline
-        memories = sorted(memories, key=lambda x: x.get("occurred_start") or "9999-12-31")
-
-        prompt = f"""
-Analyze these memoir entries. For each one extract structured facts.
-{json.dumps(memories, indent=2)}
-
-Return JSON exactly as:
-{{
-  "facts": [
-    {{
-      "id": "memory_uuid",
-      "title": "entry title",
-      "date": "YYYY-MM-DD or null",
-      "chapter_id": "existing_chapter_id or null",
-      "extracted_era": "e.g. 1980s, Childhood, College Years",
-      "topic": "main theme",
-      "story_content": "3-4 sentence summary of what happened (paraphrase, do not copy full text)"
-    }}
-  ]
-}}
-"""
-        llm_res = _call_llm_json(prompt)
-        if llm_res and "facts" in llm_res:
-            return llm_res["facts"]
-
-        facts = []
-        for m in memories:
-            date_val = m.get("occurred_start")
-            extracted_era = "Timeless Memories"
-            if date_val and len(str(date_val)) >= 4:
-                year = str(date_val)[:4]
-                if year.isdigit():
-                    extracted_era = f"The {year[:3]}0s"
-
-            body = m.get("body_text") or ""
-            facts.append({
-                "id": m["id"],
-                "title": m.get("title") or "Untitled Entry",
-                "date": m.get("occurred_start"),
-                "chapter_id": m.get("chapter_id"),
-                "extracted_era": extracted_era,
-                "topic": m.get("title") or "Memory",
-                "story_content": body[:400] if body else (m.get("title") or ""),
-            })
-        return facts
-
-
-class OrganizerAgent:
-    def __init__(self, client: MCPClient):
-        self.client = client
-
-    def propose(self, facts):
-        existing_chapters = {c["id"]: c for c in self.client.read_resource("chapters")}
-
-        prompt = f"""
-You are a master biographer organizing a family memoir into beautiful, flowing chapters.
-
-MEMORY FACTS:
-{json.dumps(facts, indent=2)}
-
-EXISTING CHAPTERS (if any):
-{json.dumps(list(existing_chapters.values()), indent=2)}
-
-STRICT RULES:
-1. Create 3 to 6 chapters to beautifully cover the subject's life.
-2. Order the chapters in STRICT ASCENDING CHRONOLOGICAL ORDER (e.g., Birth, Early Years, School, Adulthood, Later Life). Progress naturally through time.
-3. Each chapter MUST have:
-   - "title": a short original artistic title (e.g. "First Steps", "The Open Window"). NEVER use a raw memory title.
-   - "summary": A rich, beautifully written, highly engaging biographical narrative (2 to 4 paragraphs) that synthesizes all memories in that chapter. Connect the dots into a smooth, flowing story. Do NOT just list memory titles. Make it read like a published biography.
-   - "memories": array of {{ "id", "title", "date" }} for every memory placed in the chapter. Order these memories chronologically within the chapter!
-4. Every memory id must appear in exactly one chapter.
-
-Return JSON exactly as:
-{{
-  "chapters": [
-    {{
-      "title": "Original Chapter Title",
-      "summary": "Rich synthesized biographical narrative paragraph 1.\\n\\nParagraph 2...",
-      "memories": [
-        {{ "id": "memory_id", "title": "entry title", "date": "date or null" }}
-      ]
-    }}
-  ]
-}}
-"""
-        llm_res = _call_llm_json(prompt)
-        if llm_res and "chapters" in llm_res:
-            return self.client.call_tool("propose_chapter_set", {"chapters": llm_res["chapters"]})
-
-        buckets: dict[str, list] = {}
-        for f in facts:
-            key = f.get("extracted_era") or "Timeless Reflections"
-            buckets.setdefault(key, []).append(f)
-
-        # Guardrail: the fallback path must never produce ~1 chapter per memory.
-        MAX_CHAPTERS = 6
-        if len(facts) > MAX_CHAPTERS and len(buckets) > MAX_CHAPTERS:
-            all_sorted = sorted(facts, key=lambda x: x.get("date") or "9999-12-31")
-            chunk_size = max(2, -(-len(all_sorted) // MAX_CHAPTERS))  # ceil division
-            buckets = {}
-            for i in range(0, len(all_sorted), chunk_size):
-                chunk = all_sorted[i:i + chunk_size]
-                if not chunk:
-                    continue
-                label = chunk[0].get("extracted_era") or f"Chapter {i // chunk_size + 1}"
-                buckets[f"{label}__{i}"] = chunk
-
-        proposal = []
-        for era, items in buckets.items():
-            proposal.append({
-                "title": _fallback_title(era, items),
-                "summary": _fallback_summary(items),
-                "memories": [
-                    {
-                        "id": it["id"],
-                        "title": it.get("title") or "Untitled Entry",
-                        "date": it.get("date"),
-                    }
-                    for it in items
-                ],
-            })
-        return self.client.call_tool("propose_chapter_set", {"chapters": proposal})
-
-
-class RefinerAgent:
-    def __init__(self, client: MCPClient):
-        self.client = client
-
-    def refine(self, current_proposal, user_prompt):
-        memories = self.client.read_resource("memories")
-
-        prompt = f"""
-You are refining a memoir chapter proposal based on the owner's chat request.
-
-CURRENT PROPOSAL:
-{json.dumps(current_proposal, indent=2)}
-
-OWNER REQUEST:
-"{user_prompt}"
-
-RAW MEMORIES (reference only):
-{json.dumps(memories, indent=2)}
-
-RULES:
-1. Apply the owner's request (merge/split/rename/retone as asked).
-2. Ensure chapters remain in strict chronological ascending order.
-3. Each chapter needs an original "title" and a rich, beautifully written biographical "summary" (2 to 4 paragraphs) covering all of its memories with smooth narrative flow. Do NOT copy full body text into the summary.
-4. Keep every memory id assigned to exactly one chapter.
-
-Return JSON exactly as:
-{{
-  "chapters": [
-    {{
-      "title": "Chapter Title",
-      "summary": "Rich synthesized biographical paragraph 1.\\n\\nParagraph 2...",
-      "memories": [
-        {{ "id": "memory_id", "title": "entry title", "date": "date or null" }}
-      ]
-    }}
-  ]
-}}
-"""
-        llm_res = _call_llm_json(prompt)
-        if llm_res and "chapters" in llm_res:
-            return self.client.call_tool("propose_chapter_set", {"chapters": llm_res["chapters"]})
-        return current_proposal
-
-
-class ReviewerAgent:
-    def __init__(self, client: MCPClient):
-        self.client = client
-
-    def review(self, proposal):
-        seen = set()
-        valid = []
-        for ch in proposal.get("chapters", []):
-            clean = []
-            for m in ch.get("memories") or []:
-                mid = m.get("id")
-                if mid and mid not in seen:
-                    clean.append({
-                        "id": mid,
-                        "title": m.get("title") or "Untitled Entry",
-                        "date": m.get("date"),
-                    })
-                    seen.add(mid)
-            if clean:
-                valid.append({
-                    "title": ch.get("title") or "Untitled Chapter",
-                    "summary": ch.get("summary") or _fallback_summary([
-                        {"story_content": m.get("title", "")} for m in clean
-                    ]),
-                    "memories": clean,
-                })
-        return {"chapters": valid}
-
+logger = logging.getLogger(__name__)
 
 class ChapterService:
+    """
+    Coordinates the AI memoir organisation lifecycle while keeping the
+    AI layer (LangChain) isolated behind a small interface.
+    """
+
+    # ------------------------------------------------------------------
+    # Generation
+    # ------------------------------------------------------------------
+    @classmethod
+    def start_generation(cls, memoir_id: str, user_id: str) -> tuple:
+        """
+        Validates the requester, loads + normalises the memoir's memories,
+        and records a 'running' generation job. Returns (generation_row,
+        normalized_memories) so the caller can schedule the LLM work.
+        """
+        verify_active_participant(
+            memoir_id, user_id, required_roles=["owner", "admin"]
+        )
+
+        latest = chapter_repository.fetch_latest_generation(memoir_id)
+        if latest and latest.get("status") == "running":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A memoir generation is already running for this memoir.",
+            )
+
+        memoir = memoir_repository.get_memoir_by_id(memoir_id)
+        if memoir and NarrativeService.is_running(memoir):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A narrative rewrite is still running for this memoir. Try again shortly.",
+            )
+
+        res = chapter_repository.fetch_memories_for_organisation(memoir_id)
+        rows = res.data if res and res.data else []
+        if not rows:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No memories found for this memoir. Add memories before generating chapters.",
+            )
+
+        memories = _normalize_memories(rows)
+
+        record = {
+            "memoir_id": memoir_id,
+            "status": "running",
+            "memory_count": len(memories),
+            "started_by_user_id": user_id,
+        }
+        insert_res = chapter_repository.insert_generation_record(record)
+        generation = insert_res.data[0]
+        return generation, memories
+
+    @classmethod
+    def run_generation_job(
+        cls,
+        memoir_id: str,
+        generation_id: str,
+        memories: List[MemoryInputItem],
+        user_id: str,
+    ):
+        """
+        Background worker: asks the LangChain chain to organise the memories,
+        validates the structured output, then replaces any previous draft
+        chapters and marks the generation completed. Failures are recorded on
+        the generation row so the status endpoint can surface them.
+        """
+        try:
+            result = MemoirOrganiserChain().organise(memories)
+            cls._validate_ai_output(result, memories, memoir_id)
+            cls._save_chapters(memoir_id, result)
+
+            chapter_repository.update_generation_record(generation_id, {
+                "status": "completed",
+                "error_message": None,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            })
+        except Exception as e:
+            logger.exception("Memoir generation %s failed for memoir %s",
+                             generation_id, memoir_id)
+            chapter_repository.update_generation_record(generation_id, {
+                "status": "failed",
+                "error_message": str(e),
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            })
+            raise
+
+        # Chapters are saved and the generation is marked completed. The AI
+        # polish (personality profile + rewrite) is a best-effort follow-up:
+        # if it fails, the chapters stay valid and the failure is recorded on
+        # the memoir's narrative status instead.
+        try:
+            if NarrativeService.claim_job(memoir_id):
+                NarrativeService.run_narrative_job(memoir_id)
+        except Exception:
+            logger.exception("Could not start the narrative step for memoir %s", memoir_id)
+
+    @classmethod
+    def get_generation_status(cls, memoir_id: str, user_id: str) -> GenerationStatusData:
+        """Returns the latest generation job state, or 'idle' if none ran yet."""
+        verify_active_participant(memoir_id, user_id)
+        gen = chapter_repository.fetch_latest_generation(memoir_id)
+        if not gen:
+            return GenerationStatusData(memoir_id=memoir_id, status="idle")
+
+        return GenerationStatusData(
+            memoir_id=memoir_id,
+            generation_id=gen["id"],
+            status=gen["status"],
+            memory_count=gen.get("memory_count"),
+            error_message=gen.get("error_message"),
+            started_at=gen.get("started_at"),
+            finished_at=gen.get("finished_at"),
+        )
+
+    # ------------------------------------------------------------------
+    # Validation (step 5 of the design: never trust the AI blindly)
+    # ------------------------------------------------------------------
     @staticmethod
-    def generate_proposal(memoir_id: str):
-        server = MCPServer(memoir_id)
-        client = MCPClient(server)
+    def _validate_ai_output(
+        result: MemoirOrganisationResult,
+        memories: List[MemoryInputItem],
+        memoir_id: str,
+    ):
+        """
+        Rejects AI output that is structurally unsafe: chapters referring to
+        memories we never provided, duplicated or missing memories, empty
+        chapters, or out-of-range confidence. The original memory IDs keep
+        every chapter traceable to its source content.
+        """
+        provided_ids = {str(item.id) for item in memories}
+        chapters = result.chapters
 
-        facts = ReaderAgent(client).extract_facts()
-        proposal = OrganizerAgent(client).propose(facts)
-        return ReviewerAgent(client).review(proposal)
+        if not chapters:
+            raise ValueError("The model returned no chapters.")
 
+        if len(chapters) > CHAPTER_MAX_LIMIT:
+            raise ValueError(
+                f"The model returned {len(chapters)} chapters; maximum allowed is {CHAPTER_MAX_LIMIT}."
+            )
+        if len(memories) >= CHAPTER_MIN_LIMIT and len(chapters) < CHAPTER_MIN_LIMIT:
+            # Below the "ideal" chapter count, but not structurally unsafe: a
+            # small or tightly-related set of memories can legitimately group
+            # into fewer chapters. Log it for visibility instead of rejecting
+            # a valid, well-formed result.
+            logger.info(
+                "Memoir %s: model returned %d chapter(s), fewer than the suggested minimum of %d.",
+                memoir_id, len(chapters), CHAPTER_MIN_LIMIT,
+            )
+
+        assigned_ids = set()
+        for chapter in chapters:
+            if not chapter.title or not chapter.title.strip():
+                raise ValueError("The model returned a chapter without a title.")
+            if not chapter.memory_ids:
+                raise ValueError(f"Chapter '{chapter.title}' has no memories assigned.")
+            if not (0.0 <= chapter.confidence <= 1.0):
+                raise ValueError(f"Chapter '{chapter.title}' has invalid confidence '{chapter.confidence}'.")
+
+            for memory_id in chapter.memory_ids:
+                if memory_id not in provided_ids:
+                    raise ValueError(
+                        f"Chapter '{chapter.title}' references memory '{memory_id}' that was never provided. "
+                        "The AI may have invented data; generation refused and can be retried."
+                    )
+                if memory_id in assigned_ids:
+                    raise ValueError(
+                        f"Memory '{memory_id}' was assigned to more than one chapter."
+                    )
+                assigned_ids.add(memory_id)
+
+        unassigned = provided_ids - assigned_ids
+        if unassigned:
+            raise ValueError(
+                f"{len(unassigned)} provided memories were not assigned to any chapter."
+            )
+
+    # ------------------------------------------------------------------
+    # Persistence helpers
+    # ------------------------------------------------------------------
     @staticmethod
-    def refine_proposal(memoir_id: str, current_proposal: dict, user_prompt: str):
-        server = MCPServer(memoir_id)
-        client = MCPClient(server)
+    def _save_chapters(memoir_id: str, result: MemoirOrganisationResult):
+        """Replaces prior draft chapters with the new AI suggestions."""
+        chapter_repository.clear_draft_chapters(memoir_id)
 
-        refined = RefinerAgent(client).refine(current_proposal, user_prompt)
-        return ReviewerAgent(client).review(refined)
+        chapter_records = [
+            {
+                "memoir_id": memoir_id,
+                "title": chapter.title,
+                "subtitle": chapter.subtitle,
+                "summary": chapter.summary,
+                "rationale": chapter.rationale,
+                "status": "draft",
+                "sort_order": index,
+                "confidence": chapter.confidence,
+            }
+            for index, chapter in enumerate(result.chapters)
+        ]
 
+        insert_res = chapter_repository.insert_chapters(chapter_records)
+        inserted = insert_res.data if insert_res else []
+
+        inserted_by_order = {row.get("sort_order"): row.get("id") for row in inserted}
+
+        link_records = []
+        for index, chapter in enumerate(result.chapters):
+            chapter_id = inserted_by_order.get(index)
+            if not chapter_id:
+                raise ValueError("Could not map an inserted chapter to the AI result.")
+            for memory_index, memory_id in enumerate(chapter.memory_ids):
+                link_records.append(
+                    {
+                        "chapter_id": chapter_id,
+                        "memoir_id": memoir_id,
+                        "memory_id": memory_id,
+                        "sort_order": memory_index,
+                    }
+                )
+
+        chapter_repository.insert_chapter_memories(link_records)
+
+    # ------------------------------------------------------------------
+    # Review operations (owner/admin only)
+    # ------------------------------------------------------------------
     @staticmethod
-    def apply_proposal(memoir_id: str, proposal: dict):
-        if "chapters" not in proposal:
-            raise HTTPException(status_code=400, detail="Invalid proposal structure.")
-        apply_chapters_to_db(memoir_id, proposal["chapters"])
-        return {"success": True}
+    def _with_photos(memory: dict) -> dict:
+        """Replaces the raw media join on a memory with a flat list of its photos and signed URLs."""
+        photos = []
+        for link in memory.pop("memory_media", None) or []:
+            asset = (link or {}).get("media_asset")
+            if not asset or asset.get("deleted_at") or asset.get("kind") != "photo" or not asset.get("storage_key"):
+                continue
+            url = storage_adapter.create_playback_url(asset["storage_key"], CHAPTER_PHOTO_URL_TTL)
+            if url:
+                photos.append({"id": asset["id"], "url": url, "caption": asset.get("caption")})
+        memory["photos"] = photos
+        return memory
+
+    @classmethod
+    def get_chapters(cls, memoir_id: str, user_id: str, chapter_status: Optional[str] = None) -> list:
+        """Returns chapters with their ordered member memories."""
+        verify_active_participant(memoir_id, user_id)
+
+        if chapter_status not in (None, "draft", "published"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Status filter must be one of: draft, published.",
+            )
+
+        res = chapter_repository.fetch_chapters_with_memories(memoir_id, chapter_status)
+        rows = res.data if res and res.data else []
+
+        chapters = []
+        for row in rows:
+            raw_links = [link for link in row.pop("chapter_memory", []) if link and link.get("memory")]
+            raw_links.sort(key=lambda link: link.get("sort_order", 0))
+            row["memories"] = [cls._with_photos(link["memory"]) for link in raw_links]
+            chapters.append(row)
+        return chapters
+
+    @classmethod
+    def update_chapter(
+        cls,
+        memoir_id: str,
+        chapter_id: str,
+        user_id: str,
+        payload: ChapterUpdateRequest,
+    ) -> dict:
+        """Edits title/subtitle/summary of a draft chapter."""
+        verify_active_participant(memoir_id, user_id, required_roles=["owner", "admin"])
+
+        chapter = chapter_repository.fetch_chapter_by_id(chapter_id, memoir_id)
+        if not chapter:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Chapter not found in this memoir.",
+            )
+        if chapter.get("status") == "published":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Published chapters cannot be edited.",
+            )
+
+        updates = payload.model_dump(exclude_none=True)
+        update_res = chapter_repository.update_chapter(chapter_id, memoir_id, updates)
+        updated = update_res.data[0] if update_res and update_res.data else chapter
+        return updated
+
+    @classmethod
+    def reorder_chapter_memories(
+        cls,
+        memoir_id: str,
+        chapter_id: str,
+        user_id: str,
+        memory_ids: List[str],
+    ) -> dict:
+        """Rebuilds the ordered membership of a draft chapter."""
+        verify_active_participant(memoir_id, user_id, required_roles=["owner", "admin"])
+
+        chapter = chapter_repository.fetch_chapter_by_id(chapter_id, memoir_id)
+        if not chapter:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Chapter not found in this memoir.",
+            )
+        if chapter.get("status") == "published":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Published chapters cannot be reordered.",
+            )
+
+        owned = chapter_repository.fetch_memories_by_ids(memoir_id, memory_ids)
+        owned_ids = {str(row["id"]) for row in owned}
+        missing = [m for m in memory_ids if m not in owned_ids]
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"One or more memory IDs do not belong to this memoir: {missing}",
+            )
+
+        chapter_repository.replace_chapter_memory_order(chapter_id, memoir_id, memory_ids)
+        return {"chapter_id": chapter_id, "memory_order": memory_ids}
+
+    # ------------------------------------------------------------------
+    # Publication (humans approve; the AI never publishes)
+    # ------------------------------------------------------------------
+    @classmethod
+    def publish_memoir(cls, memoir_id: str, user_id: str) -> dict:
+        """Promotes draft chapters to published and marks the memoir published."""
+        verify_active_participant(memoir_id, user_id, required_roles=["owner", "admin"])
+
+        res = chapter_repository.fetch_chapters_with_memories(memoir_id, status="draft")
+        drafts = res.data if res and res.data else []
+        if not drafts:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No draft chapters to publish. Generate chapters first.",
+            )
+
+        chapter_repository.mark_chapters_published(memoir_id)
+        chapter_repository.update_memoir_status(memoir_id, "published")
+
+        return {
+            "memoir_id": memoir_id,
+            "chapters_published": len(drafts),
+            "memoir_status": "published",
+        }
